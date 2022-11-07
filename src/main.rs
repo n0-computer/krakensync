@@ -1,43 +1,84 @@
+#![allow(clippy::type_complexity)]
 use ahash::{AHashMap, AHashSet};
+use bitvec::vec::BitVec;
+use bytes::Bytes;
 use cid::Cid;
 use parking_lot::Mutex;
 use std::{
-    collections::{BTreeSet, VecDeque},
     iter::FusedIterator,
     marker::PhantomData,
     sync::Arc,
 };
 
-#[derive(Debug, Clone)]
-struct Store {
-    blocks: Arc<Mutex<AHashMap<Cid, (Arc<[u8]>, Arc<[Cid]>)>>>,
+trait StoreRead {
+    fn has(&self, cid: &Cid) -> anyhow::Result<bool>;
+    fn get(&self, cid: &Cid) -> anyhow::Result<Option<(Bytes, Arc<[Cid]>)>>;
 }
 
-impl Store {
-    fn get(&self, cid: &Cid) -> anyhow::Result<Option<(Arc<[u8]>, Arc<[Cid]>)>> {
-        Ok(self.blocks.lock().get(cid).cloned())
-    }
+trait StoreWrite {
+    fn put(&self, cid: &Cid, data: &[u8], links: &[Cid]) -> anyhow::Result<()>;
+    fn delete(&self, cid: &Cid) -> anyhow::Result<()>;
+}
 
+#[derive(Debug, Clone, Default)]
+pub struct Store {
+    blocks: Arc<Mutex<AHashMap<Cid, (Bytes, Arc<[Cid]>)>>>,
+}
+
+impl StoreRead for Store {
     fn has(&self, cid: &Cid) -> anyhow::Result<bool> {
         Ok(self.blocks.lock().get(cid).is_some())
     }
 
-    fn have(self, query: Query) -> anyhow::Result<Vec<bool>> {
+    fn get(&self, cid: &Cid) -> anyhow::Result<Option<(Bytes, Arc<[Cid]>)>> {
+        Ok(self.blocks.lock().get(cid).cloned())
+    }
+}
+
+impl StoreWrite for Store {
+    fn put(&self, cid: &Cid, data: &[u8], links: &[Cid]) -> anyhow::Result<()> {
+        self.blocks.lock().insert(*cid, (data.to_vec().into(), links.to_vec().into()));
+        Ok(())
+    }
+
+    fn delete(&self, cid: &Cid) -> anyhow::Result<()> {
+        self.blocks.lock().remove(cid);
+        Ok(())
+    }
+}
+
+impl Store {
+    pub fn get(&self, cid: &Cid) -> anyhow::Result<Option<(Bytes, Arc<[Cid]>)>> {
+        Ok(self.blocks.lock().get(cid).cloned())
+    }
+
+    pub fn has(&self, cid: &Cid) -> anyhow::Result<bool> {
+        Ok(self.blocks.lock().get(cid).is_some())
+    }
+
+    pub fn put(&self, cid: Cid, data: Bytes, links: Arc<[Cid]>) -> anyhow::Result<bool> {
+        Ok(self.blocks.lock().insert(cid, (data, links)).is_some())
+    }
+}
+
+trait StoreReadExt: StoreRead + Clone + Sized + 'static {
+
+    fn have(&self, query: Query) -> anyhow::Result<BitVec> {
         match query.traversal {
-            Traversal::DepthFirst => self
-                .clone()
-                .make_bitmap(DepthFirstTraversal2::new(
-                    self,
+            Traversal::DepthFirst => 
+                make_bitmap(
+                    self.clone(),
+                    DepthFirstTraversal::new(
+                    self.clone(),
                     query.root,
                     query.depth as usize,
                     query.direction == Direction::LeftToRight,
                     query.stop,
                 ))
                 .collect(),
-            Traversal::BreadthFirst => self
-                .clone()
-                .make_bitmap(BreadthFirstTraversal2::new(
-                    self,
+            Traversal::BreadthFirst => 
+                make_bitmap(self.clone(), BreadthFirstTraversal::new(
+                    self.clone(),
                     query.root,
                     query.depth as usize,
                     query.direction == Direction::LeftToRight,
@@ -47,11 +88,13 @@ impl Store {
         }
     }
 
-    fn want(self, query: Query) -> Box<dyn Iterator<Item = Response>> {
-        let bits = query.bits.to_vec().into_iter();
+    fn want(self, query: Query) -> Box<dyn Iterator<Item = WantResponse>> {
+        #[allow(clippy::unnecessary_to_owned)]
+        let bits = query.bits.into_iter();
         match query.traversal {
-            Traversal::DepthFirst => Box::new(self.clone().make_want(
-                DepthFirstTraversal2::new(
+            Traversal::DepthFirst => Box::new(make_want(
+                self.clone(),
+                DepthFirstTraversal::new(
                     self,
                     query.root,
                     query.depth as usize,
@@ -61,8 +104,9 @@ impl Store {
                 bits,
                 Default::default(),
             )),
-            Traversal::BreadthFirst => Box::new(self.clone().make_want(
-                BreadthFirstTraversal2::new(
+            Traversal::BreadthFirst => Box::new(make_want(
+                self.clone(),
+                BreadthFirstTraversal::new(
                     self,
                     query.root,
                     query.depth as usize,
@@ -74,41 +118,45 @@ impl Store {
             )),
         }
     }
+}
 
-    fn make_bitmap(
-        self,
-        iter: impl Iterator<Item = anyhow::Result<(Cid, Extra)>> + 'static,
-    ) -> impl Iterator<Item = anyhow::Result<bool>> + 'static {
-        iter.take_while(|x| !matches!(x, Ok((_, Extra::NotFound))))
-            .map(move |item| {
-                let (cid, data) = item?;
-                Ok(match data {
-                    Extra::Branch(_) => true,
-                    Extra::Leaf => self.has(&cid)?,
-                    Extra::NotFound => unreachable!(),
-                })
+impl <S: StoreRead + Clone + Sized + 'static> StoreReadExt for S {}
+
+fn make_bitmap(
+    store: impl StoreRead,
+    iter: impl Iterator<Item = anyhow::Result<(Cid, Extra)>>,
+) -> impl Iterator<Item = anyhow::Result<bool>> {
+    // todo: we could in theory do all has queries in one operation
+    iter.take_while(|x| !matches!(x, Ok((_, Extra::NotFound))))
+        .map(move |item| {
+            let (cid, data) = item?;
+            Ok(match data {
+                Extra::Branch(_) => true,
+                Extra::Leaf => store.has(&cid)?,
+                Extra::NotFound => unreachable!(),
             })
-    }
+        })
+}
 
     fn make_want(
-        self,
+        store: impl StoreRead + 'static,
         iter: impl Iterator<Item = anyhow::Result<(Cid, Extra)>> + 'static,
         bitmap: impl Iterator<Item = bool> + 'static,
         limits: Limits,
-    ) -> impl Iterator<Item = Response> + 'static {
+    ) -> impl Iterator<Item = WantResponse> + 'static {
         let mut remaining_send_blocks = limits.send_blocks;
         let mut remaining_send_bytes = limits.send_bytes;
         let mut remaining_read_blocks = limits.read_blocks;
         let mut remaining_read_bytes = limits.read_bytes;
-        let mut track_read_limits = move |data: &[u8]| -> std::result::Result<(), Response> {
+        let mut track_read_limits = move |data: &[u8]| -> std::result::Result<(), WantResponse> {
             if remaining_read_blocks == 0 {
-                return Err(Response::MaxBlocks);
+                return Err(WantResponse::MaxBlocks);
             } else {
                 remaining_read_blocks -= 1;
             }
             let data_len = data.len() as u64;
             if remaining_read_bytes < data_len {
-                Err(Response::MaxBytes)
+                Err(WantResponse::MaxBytes)
             } else {
                 remaining_read_bytes -= data_len;
                 Ok(())
@@ -118,20 +166,20 @@ impl Store {
         let mut send_block_limited =
             move |index: usize,
                   cid: Cid,
-                  data: Arc<[u8]>|
-                  -> std::result::Result<Option<Response>, Response> {
+                  data: Bytes|
+                  -> std::result::Result<Option<WantResponse>, WantResponse> {
                 if remaining_send_blocks == 0 {
-                    return Err(Response::MaxBlocks);
+                    return Err(WantResponse::MaxBlocks);
                 } else {
                     remaining_send_blocks -= 1;
                 }
                 let data_len = data.len() as u64;
                 if remaining_send_bytes < data_len {
-                    return Err(Response::MaxBytes);
+                    return Err(WantResponse::MaxBytes);
                 } else {
                     remaining_send_bytes -= data_len;
                 }
-                Ok(Some(Response::Block(Block::new(index, cid, data))))
+                Ok(Some(WantResponse::Block(Block::new(index, cid, data))))
             };
         // zip all that is needed, and flatten it for convenience
         let flat = iter.enumerate().zip(bitmap).map(|((index, item), take)| {
@@ -141,7 +189,7 @@ impl Store {
         // iterate over the result, applying limits and skipping 0 bits in the bitmap
         limit(flat, move |item| {
             // terminate on internal error
-            let (index, cid, data, take) = item.map_err(Response::internal_error)?;
+            let (index, cid, data, take) = item.map_err(WantResponse::internal_error)?;
             match data {
                 Extra::Branch(data) if take => {
                     // it was a branch, so we already have the data
@@ -156,12 +204,12 @@ impl Store {
                 }
                 Extra::Leaf if take => {
                     // it was a leaf, so we have to try to get the data
-                    if let Some((data, _)) = self.get(&cid).map_err(Response::internal_error)? {
+                    if let Some((data, _)) = store.get(&cid).map_err(WantResponse::internal_error)? {
                         // we have to keep track of how much we read from the store
                         track_read_limits(&data)?;
                         send_block_limited(index, cid, data)
                     } else {
-                        Err(Response::NotFound(cid))
+                        Err(WantResponse::NotFound(cid))
                     }
                 }
                 Extra::Leaf => {
@@ -170,14 +218,13 @@ impl Store {
                 }
                 Extra::NotFound => {
                     // terminate the iteration with a NotFound
-                    Err(Response::NotFound(cid))
+                    Err(WantResponse::NotFound(cid))
                 }
             }
         })
     }
-}
 
-struct Limits {
+pub struct Limits {
     /// maximum number of blocks to send
     send_blocks: u64,
     /// maximum number of bytes to send
@@ -186,6 +233,15 @@ struct Limits {
     read_blocks: u64,
     /// maximum number of bytes to read from the store
     read_bytes: u64,
+}
+
+impl Limits {
+    fn min(&mut self, that: &Limits) {
+        self.send_blocks = self.send_blocks.min(that.send_blocks);
+        self.send_bytes = self.send_bytes.min(that.send_bytes);
+        self.read_blocks = self.read_blocks.min(that.read_blocks);
+        self.read_bytes = self.read_bytes.min(that.read_bytes);
+    }
 }
 
 impl Default for Limits {
@@ -268,17 +324,20 @@ macro_rules! unwrap_or {
     };
 }
 
-struct DepthFirstTraversal2 {
-    store: Store,
+/// A depth first iterator over a dag, limited by a maximum depth and a set of already visited nodes.
+///
+/// Nodes will be reported as leafs if they are at the maximum depth, even though they might have links.
+struct DepthFirstTraversal<S> {
+    store: S,
     visited: AHashSet<Cid>,
     stack: Vec<Vec<Cid>>,
     max_depth: usize,
     left_to_right: bool,
 }
 
-impl DepthFirstTraversal2 {
+impl<S: StoreRead> DepthFirstTraversal<S> {
     fn new(
-        store: Store,
+        store: S,
         root: Cid,
         depth: usize,
         left_to_right: bool,
@@ -308,7 +367,7 @@ impl DepthFirstTraversal2 {
             }
             self.visited.insert(cid);
             // we are at the max depth, so we don't need the links
-            if self.stack.len() == self.max_depth {
+            if self.stack.len() - 1 == self.max_depth {
                 break Some((cid, Extra::Leaf));
             }
             // get the data for the cid, if we can't get it, abort
@@ -332,20 +391,23 @@ impl DepthFirstTraversal2 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Extra {
-    Branch(Arc<[u8]>),
+    Branch(Bytes),
     Leaf,
     NotFound,
 }
 
-impl Iterator for DepthFirstTraversal2 {
+impl<S: StoreRead> Iterator for DepthFirstTraversal<S> {
     type Item = anyhow::Result<(Cid, Extra)>;
     fn next(&mut self) -> Option<Self::Item> {
         self.next0().transpose()
     }
 }
 
-struct BreadthFirstTraversal2 {
-    store: Store,
+/// A breath first traversal of a dag, limited by depth and a set of already visited nodes.
+///
+/// Nodes will be reported as leafs if they are at the maximum depth, even though they might have links.
+struct BreadthFirstTraversal<S> {
+    store: S,
     visited: AHashSet<Cid>,
     current: Vec<Cid>,
     next: Vec<Cid>,
@@ -353,9 +415,9 @@ struct BreadthFirstTraversal2 {
     left_to_right: bool,
 }
 
-impl BreadthFirstTraversal2 {
+impl<S: StoreRead> BreadthFirstTraversal<S> {
     fn new(
-        store: Store,
+        store: S,
         root: Cid,
         depth: usize,
         left_to_right: bool,
@@ -410,7 +472,7 @@ impl BreadthFirstTraversal2 {
     }
 }
 
-impl Iterator for BreadthFirstTraversal2 {
+impl<S: StoreRead> Iterator for BreadthFirstTraversal<S> {
     type Item = anyhow::Result<(Cid, Extra)>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -425,7 +487,7 @@ impl Iterator for BreadthFirstTraversal2 {
 type CidSet = AHashSet<Cid>;
 
 /// bitmap of blocks to get
-type Bitmap = Arc<[bool]>;
+type Bitmap = BitVec;
 
 #[derive(Debug, Default, Clone, Copy)]
 enum Traversal {
@@ -445,11 +507,14 @@ enum Direction {
     RightToLeft = 1,
 }
 
-struct Query {
+pub struct Query {
     root: Cid,
 
     /// cids to stop the traversal at (exclusive)
     stop: CidSet,
+
+    /// depth of traversal
+    depth: u64,
 
     /// traversal order
     traversal: Traversal,
@@ -457,21 +522,45 @@ struct Query {
     /// direction of traversal
     direction: Direction,
 
-    /// depth of traversal
-    depth: u64,
-
     /// bitmap of cids for which to send blocks
     bits: Bitmap,
-
-    /// maximum number of bytes to send
-    ///
-    /// will be min-combined with the server limit
-    ///
-    /// do we want the client to be able to specify this?
-    max_bytes: u64,
 }
 
-struct Block {
+impl Query {
+    fn depth(self, depth: u64) -> Self {
+        Self { depth, ..self }
+    }
+
+    fn bits(self, bits: Bitmap) -> Self {
+        Self { bits, ..self }
+    }
+
+    fn stop(self, stop: AHashSet<Cid>) -> Self {
+        Self { stop, ..self }
+    }
+
+    fn direction(self, direction: Direction) -> Self {
+        Self { direction, ..self }
+    }
+
+    fn traversal(self, traversal: Traversal) -> Self {
+        Self { traversal, ..self }
+    }
+
+    fn new(root: Cid) -> Self {
+        Self {
+            root,
+            depth: u64::MAX,
+            traversal: Traversal::DepthFirst,
+            direction: Direction::LeftToRight,
+            bits: BitVec::repeat(true, 1024),
+            stop: AHashSet::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block {
     /// index of the block in the traversal
     ///
     /// We could omit this, since the nth block corresponds to the nth 1 bit in the bitmap.
@@ -482,11 +571,11 @@ struct Block {
     /// hash algo to use to reconstruct the Cid
     hash: u64,
     /// data of the block
-    data: Arc<[u8]>,
+    data: Bytes,
 }
 
 impl Block {
-    fn new(index: usize, cid: Cid, data: Arc<[u8]>) -> Self {
+    fn new(index: usize, cid: Cid, data: Bytes) -> Self {
         Self {
             index,
             codec: cid.codec(),
@@ -496,19 +585,30 @@ impl Block {
     }
 }
 
-struct BitmapUpdate {
-    bits: Bitmap,
+/// Update of an ongoing request
+pub enum WantRequestUpdate {
+    /// Cancel values, e.g. if we got them already from another node
+    Cancel(Bitmap),
+    /// Request additional values, e.g. if another node has not delivered them
+    Add(Bitmap),
 }
 
-enum Response {
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Want response
+pub enum WantResponse {
+    /// Got a block
     Block(Block),
+    /// Did not find a cid. Stream ends.
     NotFound(Cid),
+    /// Max blocks exceeded. Stream ends.
     MaxBlocks,
+    /// Max bytes exceeded. Stream ends.
     MaxBytes,
+    /// Internal error in the store. Stream ends.
     InternalError(String),
 }
 
-impl Response {
+impl WantResponse {
     fn internal_error(error: anyhow::Error) -> Self {
         Self::InternalError(error.to_string())
     }
@@ -516,4 +616,63 @@ impl Response {
 
 fn main() {
     println!("Hello, world!");
+}
+
+fn parse_bits(bits: &str) -> anyhow::Result<BitVec> {
+    let bits = bits
+        .chars()
+        .map(|c| match c {
+            '0' => Ok(false),
+            '1' => Ok(true),
+            _ => Err(anyhow::anyhow!("invalid bit")),
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(bits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cid::Cid;
+    use libipld::{Ipld, cbor::DagCborCodec, prelude::Codec, ipld};
+    use multihash::MultihashDigest;
+
+    trait StoreWriteExt: StoreWrite {
+        fn write_raw(&self, data: &[u8]) -> anyhow::Result<Cid> {
+            let hash = multihash::Code::Sha2_256.digest(&data);
+            let cid = Cid::new_v1(0x55, hash);
+            self.put(&cid, data, &[])?;
+            Ok(cid)
+        }
+
+        fn write_ipld(&self, ipld: Ipld) -> anyhow::Result<Cid> {
+            let bytes = DagCborCodec.encode(&ipld).unwrap();
+            let hash = multihash::Code::Sha2_256.digest(&bytes);
+            let cid = Cid::new_v1(0x55, hash);
+            let mut links = Vec::new();
+            ipld.references(&mut links);
+            self.put(&cid, &bytes, &links)?;
+            Ok(cid)
+        }
+    }
+
+    impl<S: StoreWrite> StoreWriteExt for S {}
+
+    #[test]
+    fn smoke() -> anyhow::Result<()> {
+        let store = Store::default();
+        let a = store.write_raw(b"abcd")?;
+        let b = store.write_raw(b"cdef")?;
+        let c = store.write_raw(b"ghij")?;
+        let d = store.write_ipld(ipld!{{
+            "a": a,
+            "b": b,
+            "c": c,
+        }})?;
+        let t = store.have(Query::new(d).depth(1))?;
+        println!("{}", t);
+        let t = store.want(Query::new(c).depth(1)).collect::<Vec<_>>();
+        println!("{:?}", t);
+        Ok(())
+    }
 }
