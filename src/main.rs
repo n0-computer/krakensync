@@ -402,7 +402,7 @@ impl<S: StoreRead> Iterator for DepthFirstTraversal<S> {
 struct BreadthFirstTraversal<S> {
     store: S,
     visited: AHashSet<Cid>,
-    current: Vec<Cid>,
+    current: std::vec::IntoIter<Cid>,
     next: Vec<Cid>,
     depth: usize,
     left_to_right: bool,
@@ -415,19 +415,17 @@ impl<S: StoreRead> BreadthFirstTraversal<S> {
             depth,
             left_to_right,
             visited,
-            current: vec![root],
+            current: vec![root].into_iter(),
             next: Vec::new(),
         }
     }
 
     fn next0(&mut self) -> anyhow::Result<Option<(Cid, Extra)>> {
         Ok(loop {
-            let cid = unwrap_or!(self.current.pop(), {
-                if self.depth > 0 {
-                    self.current = std::mem::take(&mut self.next);
-                    if self.left_to_right {
-                        self.current.reverse();
-                    }
+            let cid = unwrap_or!(self.current.next(), {
+                let t = std::mem::take(&mut self.next);
+                if self.depth > 0 && !t.is_empty() {
+                    self.current = t.into_iter();
                     self.depth -= 1;
                     continue;
                 } else {
@@ -689,15 +687,27 @@ mod tests {
             .collect::<Vec<_>>();
         println!("{:#?}\n\n", responses);
 
-        let df = Query::new(r).depth(2).traversal(DepthFirst);
+        let df = Query::new(r).traversal(DepthFirst);
         let dflr = df.clone().direction(LeftToRight);
         let dfrl = df.clone().direction(RightToLeft);
-        let bf = Query::new(r).depth(2).traversal(BreadthFirst);
+        let bf = Query::new(r).traversal(BreadthFirst);
         let bflr = bf.clone().direction(LeftToRight);
         let bfrl = bf.clone().direction(RightToLeft);
 
-        let responses = store.clone().want(dflr.clone()).collect::<Vec<_>>();
-        println!("{:#?}\n\n", responses);
+        let dflr = dflr.depth(1);
+        let dfrl = dfrl.depth(1);
+        let bflr = bflr.depth(1);
+        let bfrl = bfrl.depth(1);
+
+        assert_eq!(store.have(dflr.clone())?, parse_bits("111")?);
+        assert_eq!(store.have(dfrl.clone())?, parse_bits("111")?);
+        assert_eq!(store.have(bflr.clone())?, parse_bits("111")?);
+        assert_eq!(store.have(bfrl.clone())?, parse_bits("1111111")?);
+
+        let dflr = dflr.depth(2);
+        let dfrl = dfrl.depth(2);
+        let bflr = bflr.depth(2);
+        let bfrl = bfrl.depth(2);
 
         assert_eq!(store.have(dflr.clone())?, parse_bits("1111111")?);
         assert_eq!(store.have(dfrl.clone())?, parse_bits("1111111")?);
@@ -708,31 +718,31 @@ mod tests {
         assert_eq!(store.have(dflr.clone())?, parse_bits("1111110")?);
         assert_eq!(store.have(dfrl.clone())?, parse_bits("1101111")?);
         assert_eq!(store.have(bflr.clone())?, parse_bits("1111110")?);
-        // assert_eq!(store.have(bfrl.clone())?, parse_bits("1110111")?);
+        assert_eq!(store.have(bfrl.clone())?, parse_bits("1110111")?);
 
         store.delete(&b)?;
         assert_eq!(store.have(dflr.clone())?, parse_bits("1110110")?);
         assert_eq!(store.have(dfrl.clone())?, parse_bits("1101101")?);
         assert_eq!(store.have(bflr.clone())?, parse_bits("1111010")?);
-        // assert_eq!(store.have(bfrl.clone())?, parse_bits("1110101")?);
+        assert_eq!(store.have(bfrl.clone())?, parse_bits("1110101")?);
 
         store.delete(&c)?;
         assert_eq!(store.have(dflr.clone())?, parse_bits("1110100")?);
         assert_eq!(store.have(dfrl.clone())?, parse_bits("1100101")?);
         assert_eq!(store.have(bflr.clone())?, parse_bits("1111000")?);
-        // assert_eq!(store.have(bfrl.clone())?, parse_bits("1110001")?);
+        assert_eq!(store.have(bfrl.clone())?, parse_bits("1110001")?);
 
         store.delete(&a)?;
         assert_eq!(store.have(dflr.clone())?, parse_bits("1100100")?);
         assert_eq!(store.have(dfrl.clone())?, parse_bits("1100100")?);
         assert_eq!(store.have(bflr.clone())?, parse_bits("1110000")?);
-        // assert_eq!(store.have(bfrl.clone())?, parse_bits("1110000")?);
+        assert_eq!(store.have(bfrl.clone())?, parse_bits("1110000")?);
 
         store.delete(&b1)?;
         assert_eq!(store.have(dflr.clone())?, parse_bits("1100")?);
         assert_eq!(store.have(dfrl.clone())?, parse_bits("1")?);
-        // assert_eq!(store.have(bflr.clone())?, parse_bits("11100")?);
-        // assert_eq!(store.have(bfrl.clone())?, parse_bits("11")?);
+        assert_eq!(store.have(bflr.clone())?, parse_bits("11")?);
+        assert_eq!(store.have(bfrl.clone())?, parse_bits("1")?);
         Ok(())
     }
 }
