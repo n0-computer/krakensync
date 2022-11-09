@@ -3,6 +3,7 @@ use ahash::{AHashMap, AHashSet};
 use bitvec::vec::BitVec;
 use bytes::Bytes;
 use cid::Cid;
+use multihash::{Multihash, MultihashDigest};
 use parking_lot::Mutex;
 use std::{iter::FusedIterator, marker::PhantomData, sync::Arc};
 
@@ -126,13 +127,14 @@ fn make_bitmap(
     iter: impl Iterator<Item = anyhow::Result<(Cid, Extra)>>,
 ) -> impl Iterator<Item = anyhow::Result<bool>> {
     // todo: we could in theory do all has queries in one operation
-    iter.take_while(|x| !matches!(x, Ok((_, Extra::NotFound))))
+    iter.take_while(|x| !matches!(x, Ok((_, Extra::StopNotFound))))
         .map(move |item| {
             let (cid, data) = item?;
             Ok(match data {
                 Extra::Branch(_) => true,
+                Extra::NotFound => false,
                 Extra::Leaf => store.has(&cid)?,
-                Extra::NotFound => unreachable!(),
+                Extra::StopNotFound => unreachable!(),
             })
         })
 }
@@ -149,13 +151,13 @@ fn make_want(
     let mut remaining_read_bytes = limits.read_bytes;
     let mut track_read_limits = move |data: &[u8]| -> std::result::Result<(), WantResponse> {
         if remaining_read_blocks == 0 {
-            return Err(WantResponse::MaxBlocks);
+            return Err(WantResponse::MaxBlocksRead);
         } else {
             remaining_read_blocks -= 1;
         }
         let data_len = data.len() as u64;
         if remaining_read_bytes < data_len {
-            Err(WantResponse::MaxBytes)
+            Err(WantResponse::MaxBytesRead)
         } else {
             remaining_read_bytes -= data_len;
             Ok(())
@@ -168,17 +170,17 @@ fn make_want(
               data: Bytes|
               -> std::result::Result<Option<WantResponse>, WantResponse> {
             if remaining_send_blocks == 0 {
-                return Err(WantResponse::MaxBlocks);
+                return Err(WantResponse::MaxBlocksSent);
             } else {
                 remaining_send_blocks -= 1;
             }
             let data_len = data.len() as u64;
             if remaining_send_bytes < data_len {
-                return Err(WantResponse::MaxBytes);
+                return Err(WantResponse::MaxBytesSent);
             } else {
                 remaining_send_bytes -= data_len;
             }
-            Ok(Some(WantResponse::Block(Block::new(index, cid, data))))
+            Ok(Some(WantResponse::Block(index, Block::new(cid, data))))
         };
     // zip all that is needed, and flatten it for convenience
     let flat = iter.enumerate().zip(bitmap).map(|((index, item), take)| {
@@ -208,16 +210,24 @@ fn make_want(
                     track_read_limits(&data)?;
                     send_block_limited(index, cid, data)
                 } else {
-                    Err(WantResponse::NotFound(cid))
+                    Ok(Some(WantResponse::NotFound(index, cid)))
                 }
             }
             Extra::Leaf => {
                 // skipping a leaf does not require any bookkeeping
                 Ok(None)
             }
-            Extra::NotFound => {
+            Extra::NotFound if take => {
                 // terminate the iteration with a NotFound
-                Err(WantResponse::NotFound(cid))
+                Ok(Some(WantResponse::NotFound(index, cid)))
+            }
+            Extra::NotFound => {
+                // we got a NotFound, but can continue since take is false and order is not affected yet
+                Ok(None)
+            }
+            Extra::StopNotFound => {
+                // terminate the iteration with a NotFound
+                Err(WantResponse::StopNotFound(index, cid))
             }
         }
     })
@@ -365,7 +375,7 @@ impl<S: StoreRead> DepthFirstTraversal<S> {
             }
             // get the data for the cid, if we can't get it, abort
             let (data, links) = unwrap_or!(self.store.get(&cid)?, {
-                break Some((cid, Extra::NotFound));
+                break Some((cid, Extra::StopNotFound));
             });
             // push the links if there are any
             if !links.is_empty() {
@@ -384,9 +394,14 @@ impl<S: StoreRead> DepthFirstTraversal<S> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Extra {
+    // a branch for which we have the data
     Branch(Bytes),
+    // a leaf for which we did not even try to get the data
     Leaf,
+    // not found that does not cause the traversal to abort
     NotFound,
+    // not found that causes the traversal to abort
+    StopNotFound,
 }
 
 impl<S: StoreRead> Iterator for DepthFirstTraversal<S> {
@@ -402,8 +417,8 @@ impl<S: StoreRead> Iterator for DepthFirstTraversal<S> {
 struct BreadthFirstTraversal<S> {
     store: S,
     visited: AHashSet<Cid>,
-    current: std::vec::IntoIter<Cid>,
-    next: Vec<Cid>,
+    current: (std::vec::IntoIter<Cid>, std::option::IntoIter<Cid>),
+    next: (Vec<Cid>, Option<Cid>),
     depth: usize,
     left_to_right: bool,
 }
@@ -415,17 +430,19 @@ impl<S: StoreRead> BreadthFirstTraversal<S> {
             depth,
             left_to_right,
             visited,
-            current: vec![root].into_iter(),
-            next: Vec::new(),
+            current: (vec![root].into_iter(), None.into_iter()),
+            next: Default::default(),
         }
     }
 
     fn next0(&mut self) -> anyhow::Result<Option<(Cid, Extra)>> {
         Ok(loop {
-            let cid = unwrap_or!(self.current.next(), {
-                let t = std::mem::take(&mut self.next);
-                if self.depth > 0 && !t.is_empty() {
-                    self.current = t.into_iter();
+            let cid = unwrap_or!(self.current.0.next(), {
+                let (next, stop) = std::mem::take(&mut self.next);
+                if let Some(cid) = self.current.1.next() {
+                    break Some((cid, Extra::StopNotFound));
+                } else if self.depth > 0 && (!next.is_empty() || stop.is_some()) {
+                    self.current = (next.into_iter(), stop.into_iter());
                     self.depth -= 1;
                     continue;
                 } else {
@@ -442,19 +459,25 @@ impl<S: StoreRead> BreadthFirstTraversal<S> {
                 break Some((cid, Extra::Leaf));
             }
             // get the data for the cid, if we can't get it, abort
-            let (data, links) = unwrap_or!(self.store.get(&cid)?, {
-                break Some((cid, Extra::NotFound));
-            });
-            // push the links if there are any
-            if !links.is_empty() {
-                let mut links = links.to_vec();
-                if !self.left_to_right {
-                    links.reverse();
+            if let Some((data, links)) = self.store.get(&cid)? {
+                // push the links if there are any
+                if !links.is_empty() && self.next.1.is_none() {
+                    let mut links = links.to_vec();
+                    if !self.left_to_right {
+                        // reverse to get right to left traversal
+                        links.reverse();
+                    }
+                    self.next.0.extend(links);
                 }
-                self.next.extend(links);
+                // return the cid and data
+                break Some((cid, Extra::Branch(data)));
+            } else {
+                // ensure we stop adding links for the next level, since the order is now non deterministic
+                if self.next.1.is_none() {
+                    self.next.1 = Some(cid);
+                }
+                break Some((cid, Extra::NotFound));
             }
-            // return the cid and data
-            break Some((cid, Extra::Branch(data)));
         })
     }
 }
@@ -549,11 +572,6 @@ impl Query {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
-    /// index of the block in the traversal
-    ///
-    /// We could omit this, since the nth block corresponds to the nth 1 bit in the bitmap.
-    /// But that gets complicated if you have block updates.
-    index: usize,
     /// codec to use to reconstruct the Cid
     codec: u64,
     /// hash algo to use to reconstruct the Cid
@@ -563,13 +581,18 @@ pub struct Block {
 }
 
 impl Block {
-    fn new(index: usize, cid: Cid, data: Bytes) -> Self {
+    fn new(cid: Cid, data: Bytes) -> Self {
         Self {
-            index,
             codec: cid.codec(),
             hash: cid.hash().code(),
             data,
         }
+    }
+
+    fn cid(&self) -> Cid {
+        let code = multihash::Code::try_from(self.hash).unwrap();
+        let hash = code.digest(&self.data);
+        Cid::new_v1(self.codec, hash)
     }
 }
 
@@ -585,13 +608,19 @@ pub enum WantRequestUpdate {
 /// Want response
 pub enum WantResponse {
     /// Got a block
-    Block(Block),
+    Block(usize, Block),
+    /// Did not find a cid.
+    NotFound(usize, Cid),
     /// Did not find a cid. Stream ends.
-    NotFound(Cid),
+    StopNotFound(usize, Cid),
     /// Max blocks exceeded. Stream ends.
-    MaxBlocks,
+    MaxBlocksSent,
     /// Max bytes exceeded. Stream ends.
-    MaxBytes,
+    MaxBytesSent,
+    /// Max blocks exceeded. Stream ends.
+    MaxBlocksRead,
+    /// Max bytes exceeded. Stream ends.
+    MaxBytesRead,
     /// Internal error in the store. Stream ends.
     InternalError(String),
 }
@@ -647,11 +676,42 @@ mod tests {
 
     impl<S: StoreWrite> StoreWriteExt for S {}
 
+    /// basically like a want response, but cid instead of block
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum WantResponseShort {
+        Block(Cid),
+        NotFound(Cid),
+        StopNotFound(Cid),
+        MaxBlocks,
+        MaxBytes,
+        InternalError(String),
+    }
+
+    fn short(response: WantResponse) -> WantResponseShort {
+        match response {
+            WantResponse::Block(_, block) => WantResponseShort::Block(block.cid()),
+            WantResponse::NotFound(_, cid) => WantResponseShort::NotFound(cid),
+            WantResponse::StopNotFound(_, cid) => WantResponseShort::StopNotFound(cid),
+            WantResponse::MaxBlocksRead => WantResponseShort::MaxBlocks,
+            WantResponse::MaxBytesRead => WantResponseShort::MaxBytes,
+            WantResponse::MaxBlocksSent => WantResponseShort::MaxBlocks,
+            WantResponse::MaxBytesSent => WantResponseShort::MaxBytes,
+            WantResponse::InternalError(x) => WantResponseShort::InternalError(x),
+        }
+    }
+
     #[test]
+    #[rustfmt::skip]
     fn smoke() -> anyhow::Result<()> {
         use Direction::*;
         use Traversal::*;
         let store = Store::default();
+        use WantResponseShort::*;
+
+        // small helper to reduce test boilerplate
+        let have = |q: &Query| store.have(q.clone());
+        let want = |q: &Query| store.clone().want(q.clone()).map(short).collect::<Vec<_>>();
+
         let a = store.write_raw(b"abcd")?;
         let b = store.write_raw(b"efgh")?;
         let c = store.write_raw(b"ijkl")?;
@@ -668,25 +728,8 @@ mod tests {
             "b0": b0,
             "b1": b1,
         }})?;
-        let t = store.have(Query::new(r).depth(0))?;
-        assert_eq!(t, parse_bits("1")?);
-        let t = store.have(Query::new(r).depth(1))?;
-        assert_eq!(t, parse_bits("111")?);
-        let t = store.have(Query::new(r).depth(2))?;
-        assert_eq!(t, parse_bits("1111111")?);
-
-        let responses = store
-            .clone()
-            .want(Query::new(r).depth(2).traversal(DepthFirst))
-            .collect::<Vec<_>>();
-        println!("{:#?}\n\n", responses);
-
-        let responses = store
-            .clone()
-            .want(Query::new(r).depth(2).traversal(BreadthFirst))
-            .collect::<Vec<_>>();
-        println!("{:#?}\n\n", responses);
-
+    
+        // create all the different queries
         let df = Query::new(r).traversal(DepthFirst);
         let dflr = df.clone().direction(LeftToRight);
         let dfrl = df.clone().direction(RightToLeft);
@@ -694,55 +737,109 @@ mod tests {
         let bflr = bf.clone().direction(LeftToRight);
         let bfrl = bf.clone().direction(RightToLeft);
 
+        let dflr = dflr.depth(0);
+        let dfrl = dfrl.depth(0);
+        let bflr = bflr.depth(0);
+        let bfrl = bfrl.depth(0);
+
+        assert_eq!(have(&dflr)?, parse_bits("1")?);
+        assert_eq!(have(&dfrl)?, parse_bits("1")?);
+        assert_eq!(have(&bflr)?, parse_bits("1")?);
+        assert_eq!(have(&bfrl)?, parse_bits("1")?);
+
+        assert_eq!(want(&dflr), vec![Block(r)]);
+        assert_eq!(want(&dfrl), vec![Block(r)]);
+        assert_eq!(want(&bflr), vec![Block(r)]);
+        assert_eq!(want(&bfrl), vec![Block(r)]);
+
         let dflr = dflr.depth(1);
         let dfrl = dfrl.depth(1);
         let bflr = bflr.depth(1);
         let bfrl = bfrl.depth(1);
 
-        assert_eq!(store.have(dflr.clone())?, parse_bits("111")?);
-        assert_eq!(store.have(dfrl.clone())?, parse_bits("111")?);
-        assert_eq!(store.have(bflr.clone())?, parse_bits("111")?);
-        assert_eq!(store.have(bfrl.clone())?, parse_bits("1111111")?);
+        assert_eq!(have(&dflr)?, parse_bits("111")?);
+        assert_eq!(have(&dfrl)?, parse_bits("111")?);
+        assert_eq!(have(&bflr)?, parse_bits("111")?);
+        assert_eq!(have(&bfrl)?, parse_bits("111")?);
+
+        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(b1)]);
+        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), Block(b0)]);
+        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1)]);
+        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0)]);
 
         let dflr = dflr.depth(2);
         let dfrl = dfrl.depth(2);
         let bflr = bflr.depth(2);
         let bfrl = bfrl.depth(2);
 
-        assert_eq!(store.have(dflr.clone())?, parse_bits("1111111")?);
-        assert_eq!(store.have(dfrl.clone())?, parse_bits("1111111")?);
-        assert_eq!(store.have(bflr.clone())?, parse_bits("1111111")?);
-        assert_eq!(store.have(bfrl.clone())?, parse_bits("1111111")?);
+        assert_eq!(have(&dflr)?, parse_bits("1111111")?);
+        assert_eq!(have(&dfrl)?, parse_bits("1111111")?);
+        assert_eq!(have(&bflr)?, parse_bits("1111111")?);
+        assert_eq!(have(&bfrl)?, parse_bits("1111111")?);
+
+        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(a), Block(b), Block(b1), Block(c), Block(d)]);
+        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), Block(d), Block(c), Block(b0), Block(b), Block(a)]);
+        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), Block(a), Block(b), Block(c), Block(d)]);
+        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), Block(d), Block(c), Block(b), Block(a)]);
 
         store.delete(&d)?;
-        assert_eq!(store.have(dflr.clone())?, parse_bits("1111110")?);
-        assert_eq!(store.have(dfrl.clone())?, parse_bits("1101111")?);
-        assert_eq!(store.have(bflr.clone())?, parse_bits("1111110")?);
-        assert_eq!(store.have(bfrl.clone())?, parse_bits("1110111")?);
+        assert_eq!(have(&dflr)?, parse_bits("1111110")?);
+        assert_eq!(have(&dfrl)?, parse_bits("1101111")?);
+        assert_eq!(have(&bflr)?, parse_bits("1111110")?);
+        assert_eq!(have(&bfrl)?, parse_bits("1110111")?);
+
+        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(a), Block(b), Block(b1), Block(c), NotFound(d)]);
+        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), NotFound(d), Block(c), Block(b0), Block(b), Block(a)]);
+        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), Block(a), Block(b), Block(c), NotFound(d)]);
+        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), NotFound(d), Block(c), Block(b), Block(a)]);
 
         store.delete(&b)?;
-        assert_eq!(store.have(dflr.clone())?, parse_bits("1110110")?);
-        assert_eq!(store.have(dfrl.clone())?, parse_bits("1101101")?);
-        assert_eq!(store.have(bflr.clone())?, parse_bits("1111010")?);
-        assert_eq!(store.have(bfrl.clone())?, parse_bits("1110101")?);
+        assert_eq!(have(&dflr)?, parse_bits("1110110")?);
+        assert_eq!(have(&dfrl)?, parse_bits("1101101")?);
+        assert_eq!(have(&bflr)?, parse_bits("1111010")?);
+        assert_eq!(have(&bfrl)?, parse_bits("1110101")?);
+
+        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(a), NotFound(b), Block(b1), Block(c), NotFound(d)]);
+        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), NotFound(d), Block(c), Block(b0), NotFound(b), Block(a)]);
+        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), Block(a), NotFound(b), Block(c), NotFound(d)]);
+        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), NotFound(d), Block(c), NotFound(b), Block(a)]);
 
         store.delete(&c)?;
-        assert_eq!(store.have(dflr.clone())?, parse_bits("1110100")?);
-        assert_eq!(store.have(dfrl.clone())?, parse_bits("1100101")?);
-        assert_eq!(store.have(bflr.clone())?, parse_bits("1111000")?);
-        assert_eq!(store.have(bfrl.clone())?, parse_bits("1110001")?);
+        assert_eq!(have(&dflr)?, parse_bits("1110100")?);
+        assert_eq!(have(&dfrl)?, parse_bits("1100101")?);
+        assert_eq!(have(&bflr)?, parse_bits("1111000")?);
+        assert_eq!(have(&bfrl)?, parse_bits("1110001")?);
+
+        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(a), NotFound(b), Block(b1), NotFound(c), NotFound(d)]);
+        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), NotFound(d), NotFound(c), Block(b0), NotFound(b), Block(a)]);
+        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), Block(a), NotFound(b), NotFound(c), NotFound(d)]);
+        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), NotFound(d), NotFound(c), NotFound(b), Block(a)]);
 
         store.delete(&a)?;
-        assert_eq!(store.have(dflr.clone())?, parse_bits("1100100")?);
-        assert_eq!(store.have(dfrl.clone())?, parse_bits("1100100")?);
-        assert_eq!(store.have(bflr.clone())?, parse_bits("1110000")?);
-        assert_eq!(store.have(bfrl.clone())?, parse_bits("1110000")?);
+        assert_eq!(have(&dflr)?, parse_bits("1100100")?);
+        assert_eq!(have(&dfrl)?, parse_bits("1100100")?);
+        assert_eq!(have(&bflr)?, parse_bits("1110000")?);
+        assert_eq!(have(&bfrl)?, parse_bits("1110000")?);
+
+        assert_eq!(want(&dflr), vec![Block(r), Block(b0), NotFound(a), NotFound(b), Block(b1), NotFound(c), NotFound(d)]);
+        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), NotFound(d), NotFound(c), Block(b0), NotFound(b), NotFound(a)]);
+        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), NotFound(a), NotFound(b), NotFound(c), NotFound(d)]);
+        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), NotFound(d), NotFound(c), NotFound(b), NotFound(a)]);
 
         store.delete(&b1)?;
-        assert_eq!(store.have(dflr.clone())?, parse_bits("1100")?);
-        assert_eq!(store.have(dfrl.clone())?, parse_bits("1")?);
-        assert_eq!(store.have(bflr.clone())?, parse_bits("11")?);
-        assert_eq!(store.have(bfrl.clone())?, parse_bits("1")?);
+        // b1 is gone, so with a left to right traversal, we have to give up after b0's children
+        assert_eq!(have(&dflr)?, parse_bits("1100")?);
+        // b1 is gone, so with a right to left traversal, we have to give up early
+        assert_eq!(have(&dfrl)?, parse_bits("1")?);
+        // r and b0 are there. b1 is gone. But we can still enumerate the children of b0 before breaking order
+        assert_eq!(have(&bflr)?, parse_bits("11000")?);
+        // r and b0 are there. b1 is gone. Because of rtl we can't enumerate the children of b0 before breaking order
+        assert_eq!(have(&bfrl)?, parse_bits("101")?);
+
+        assert_eq!(want(&dflr), vec![Block(r), Block(b0), NotFound(a), NotFound(b), StopNotFound(b1)]);
+        assert_eq!(want(&dfrl), vec![Block(r), StopNotFound(b1)]);
+        assert_eq!(want(&bflr), vec![Block(r), Block(b0), NotFound(b1), NotFound(a), NotFound(b), StopNotFound(b1)]);
+        assert_eq!(want(&bfrl), vec![Block(r), NotFound(b1), Block(b0), StopNotFound(b1)]);
         Ok(())
     }
 }
