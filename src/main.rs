@@ -9,7 +9,7 @@ use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld};
 use multihash::MultihashDigest;
 use parking_lot::Mutex;
 use std::{fmt::Debug, hash::Hash, iter::FusedIterator, marker::PhantomData, sync::Arc};
-
+mod quinn;
 trait StoreRead {
     fn has(&self, cid: &Cid) -> anyhow::Result<bool>;
     fn get(&self, cid: &Cid) -> anyhow::Result<Option<(Bytes, Arc<[Cid]>)>>;
@@ -774,10 +774,11 @@ impl Node {
     }
 }
 
-fn main() {
-    println!("Hello, world!");
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    quinn::main().await.unwrap();
+    Ok(())
 }
-
 #[cfg(test)]
 #[allow(clippy::redundant_clone)]
 mod tests {
