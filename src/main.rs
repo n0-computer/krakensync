@@ -1,11 +1,14 @@
 #![allow(clippy::type_complexity)]
 use ahash::{AHashMap, AHashSet};
+use async_stream::{stream, try_stream};
 use bitvec::vec::BitVec;
 use bytes::Bytes;
 use cid::Cid;
-use multihash::{Multihash, MultihashDigest};
+use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt};
+use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld};
+use multihash::MultihashDigest;
 use parking_lot::Mutex;
-use std::{iter::FusedIterator, marker::PhantomData, sync::Arc};
+use std::{fmt::Debug, hash::Hash, iter::FusedIterator, marker::PhantomData, sync::Arc};
 
 trait StoreRead {
     fn has(&self, cid: &Cid) -> anyhow::Result<bool>;
@@ -60,10 +63,10 @@ impl Store {
     }
 }
 
-trait StoreReadExt: StoreRead + Clone + Sized + 'static {
-    fn have(&self, query: Query) -> anyhow::Result<BitVec> {
+trait StoreReadExt: StoreRead + Clone + Sized + Send + 'static {
+    fn have(&self, query: Query) -> anyhow::Result<HaveResponse> {
         match query.traversal {
-            Traversal::DepthFirst => make_bitmap(
+            Traversal::DepthFirst => make_have(
                 self.clone(),
                 DepthFirstTraversal::new(
                     self.clone(),
@@ -72,9 +75,8 @@ trait StoreReadExt: StoreRead + Clone + Sized + 'static {
                     query.direction == Direction::LeftToRight,
                     query.stop,
                 ),
-            )
-            .collect(),
-            Traversal::BreadthFirst => make_bitmap(
+            ),
+            Traversal::BreadthFirst => make_have(
                 self.clone(),
                 BreadthFirstTraversal::new(
                     self.clone(),
@@ -83,12 +85,11 @@ trait StoreReadExt: StoreRead + Clone + Sized + 'static {
                     query.direction == Direction::LeftToRight,
                     query.stop,
                 ),
-            )
-            .collect(),
+            ),
         }
     }
 
-    fn want(self, query: Query) -> Box<dyn Iterator<Item = WantResponse>> {
+    fn want(self, query: Query) -> Box<dyn Iterator<Item = WantResponse> + Send> {
         #[allow(clippy::unnecessary_to_owned)]
         let bits = query.bits.into_iter();
         match query.traversal {
@@ -120,14 +121,22 @@ trait StoreReadExt: StoreRead + Clone + Sized + 'static {
     }
 }
 
-impl<S: StoreRead + Clone + Sized + 'static> StoreReadExt for S {}
+impl<S: StoreRead + Clone + Sized + Send + 'static> StoreReadExt for S {}
 
-fn make_bitmap(
+fn make_have(
     store: impl StoreRead,
     iter: impl Iterator<Item = anyhow::Result<(Cid, Extra)>>,
-) -> impl Iterator<Item = anyhow::Result<bool>> {
+) -> anyhow::Result<HaveResponse> {
     // todo: we could in theory do all has queries in one operation
-    iter.take_while(|x| !matches!(x, Ok((_, Extra::StopNotFound))))
+    let mut stop: Option<Cid> = None;
+    let bitmap = iter
+        .take_while(|x| match x {
+            Ok((cid, Extra::StopNotFound)) => {
+                stop = Some(*cid);
+                false
+            }
+            _ => true,
+        })
         .map(move |item| {
             let (cid, data) = item?;
             Ok(match data {
@@ -137,6 +146,8 @@ fn make_bitmap(
                 Extra::StopNotFound => unreachable!(),
             })
         })
+        .collect::<anyhow::Result<BitVec>>()?;
+    Ok(HaveResponse { bitmap, stop })
 }
 
 fn make_want(
@@ -256,9 +267,9 @@ impl Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            send_blocks: 1000,
+            send_blocks: 10000,
             send_bytes: 1000 * 1024 * 1024,
-            read_blocks: 1000,
+            read_blocks: 10000,
             read_bytes: 1000 * 1024 * 1024,
         }
     }
@@ -570,7 +581,7 @@ impl Query {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Block {
     /// codec to use to reconstruct the Cid
     codec: u64,
@@ -578,6 +589,16 @@ pub struct Block {
     hash: u64,
     /// data of the block
     data: Bytes,
+}
+
+impl Debug for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Block")
+            .field("codec", &self.codec)
+            .field("hash", &self.hash)
+            .field("data", &self.data.len())
+            .finish()
+    }
 }
 
 impl Block {
@@ -607,11 +628,11 @@ pub enum WantRequestUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Want response
 pub enum WantResponse {
-    /// Got a block
+    /// Got a block.
     Block(usize, Block),
     /// Did not find a cid.
     NotFound(usize, Cid),
-    /// Did not find a cid. Stream ends.
+    /// We did not find a block and were unable to keep track of the index. Stream ends.
     StopNotFound(usize, Cid),
     /// Max blocks exceeded. Stream ends.
     MaxBlocksSent,
@@ -628,6 +649,128 @@ pub enum WantResponse {
 impl WantResponse {
     fn internal_error(error: anyhow::Error) -> Self {
         Self::InternalError(error.to_string())
+    }
+}
+
+#[derive(Debug)]
+struct HaveResponse {
+    bitmap: BitVec,
+    stop: Option<Cid>,
+}
+
+impl HaveResponse {
+    fn is_complete(&self) -> bool {
+        self.stop.is_none() && self.bitmap.all() && !self.bitmap.is_empty()
+    }
+}
+
+trait SyncApi: Debug + Send + Sync + 'static {
+    fn have(&self, query: Query) -> BoxFuture<anyhow::Result<HaveResponse>>;
+    fn want(
+        &self,
+        query: Query,
+        changes: BoxStream<WantRequestUpdate>,
+    ) -> BoxFuture<anyhow::Result<BoxStream<WantResponse>>>;
+}
+
+impl SyncApi for Box<dyn SyncApi> {
+    fn have(&self, query: Query) -> BoxFuture<anyhow::Result<HaveResponse>> {
+        (**self).have(query)
+    }
+
+    fn want(
+        &self,
+        query: Query,
+        changes: BoxStream<WantRequestUpdate>,
+    ) -> BoxFuture<anyhow::Result<BoxStream<WantResponse>>> {
+        (**self).want(query, changes)
+    }
+}
+
+#[derive(Debug)]
+struct Node {
+    peers: AHashMap<u64, Box<dyn SyncApi>>,
+    store: Store,
+}
+
+impl Node {
+    fn new(store: Store) -> Self {
+        Self {
+            store,
+            peers: Default::default(),
+        }
+    }
+}
+
+impl SyncApi for Node {
+    fn have(&self, query: Query) -> BoxFuture<anyhow::Result<HaveResponse>> {
+        let store = self.store.clone();
+        async move { store.have(query) }.boxed()
+    }
+
+    fn want(
+        &self,
+        query: Query,
+        changes: BoxStream<WantRequestUpdate>,
+    ) -> BoxFuture<anyhow::Result<BoxStream<WantResponse>>> {
+        let res = futures::stream::iter(self.store.clone().want(query));
+        futures::future::ok(res.boxed()).boxed()
+    }
+}
+
+impl Node {
+    fn add_peer(&mut self, id: u64, peer: Box<dyn SyncApi>) {
+        self.peers.insert(id, peer);
+    }
+
+    fn sync(&self, query: Query) -> BoxFuture<anyhow::Result<BoxStream<anyhow::Result<()>>>> {
+        println!("syncing {}", query.root);
+        let s = try_stream! {
+            loop {
+                let peers = self.peers.values().collect::<Vec<_>>();
+                let mut mine = self.store.have(query.clone())?;
+                if mine.is_complete() {
+                    break;
+                }
+                if let Some(peer) = peers.first() {
+                    let mut query = query.clone();
+                    query.bits = !mine.bitmap.clone();
+                    query.bits.extend((0..1024).map(|_| true));
+                    let mut stream = peer.want(query, futures::stream::empty().boxed()).await?;
+                    while let Some(response) = stream.next().await {
+                        match response {
+                            WantResponse::Block(index, block) => {
+                                let cid = block.cid();
+                                let mut links = Vec::new();
+                                DagCborCodec.references::<Ipld, _>(&block.data, &mut links)?;
+                                println!("got block {} {} {}", index, cid, links.len());
+                                self.store.put(cid, block.data, links.into())?;
+                                if index < mine.bitmap.len() {
+                                    mine.bitmap.set(index, true);
+                                }
+                            }
+                            WantResponse::NotFound(index, cid) => {
+                            }
+                            WantResponse::StopNotFound(index, cid) => {
+                            }
+                            WantResponse::MaxBlocksSent => {
+                            }
+                            WantResponse::MaxBytesSent => {
+                            }
+                            WantResponse::MaxBlocksRead => {
+                            }
+                            WantResponse::MaxBytesRead => {
+                            }
+                            WantResponse::InternalError(error) => {
+                            }
+                        }
+                    }
+                }
+                yield ();
+            }
+        }
+        .boxed();
+        futures::future::ready(anyhow::Ok(s)).boxed()
     }
 }
 
@@ -676,6 +819,30 @@ mod tests {
 
     impl<S: StoreWrite> StoreWriteExt for S {}
 
+    // Make a tree given tree parameters and an iterator of leafs
+    fn make_tree(
+        store: &Store,
+        branches: usize,
+        depth: usize,
+        leaf: &mut impl Iterator<Item = Vec<u8>>,
+    ) -> anyhow::Result<Option<Cid>> {
+        if depth == 0 {
+            leaf.next().map(|data| store.write_raw(&data)).transpose()
+        } else {
+            let mut links = Vec::new();
+            for i in 0..branches {
+                if let Some(cid) = make_tree(store, branches, depth - 1, leaf)? {
+                    links.push(Ipld::Link(cid));
+                }
+            }
+            Ok(if !links.is_empty() {
+                Some(store.write_ipld(Ipld::List(links))?)
+            } else {
+                None
+            })
+        }
+    }
+
     /// basically like a want response, but cid instead of block
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum WantResponseShort {
@@ -705,11 +872,11 @@ mod tests {
     fn smoke() -> anyhow::Result<()> {
         use Direction::*;
         use Traversal::*;
-        let store = Store::default();
         use WantResponseShort::*;
+        let store = Store::default();
 
         // small helper to reduce test boilerplate
-        let have = |q: &Query| store.have(q.clone());
+        let have = |q: &Query| anyhow::Ok(store.have(q.clone())?.bitmap);
         let want = |q: &Query| store.clone().want(q.clone()).map(short).collect::<Vec<_>>();
 
         let a = store.write_raw(b"abcd")?;
@@ -840,6 +1007,51 @@ mod tests {
         assert_eq!(want(&dfrl), vec![Block(r), StopNotFound(b1)]);
         assert_eq!(want(&bflr), vec![Block(r), Block(b0), NotFound(b1), NotFound(a), NotFound(b), StopNotFound(b1)]);
         assert_eq!(want(&bfrl), vec![Block(r), NotFound(b1), Block(b0), StopNotFound(b1)]);
+        Ok(())
+    }
+
+    // #[test]
+    // fn deflate() {
+    //     let data = [
+    //         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    //         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    //         1, 1, 1, 1, 1, 1,
+    //     ];
+    //     let def = lz4_flex::compress(&data);
+    //     println!("deflated: {:?}", def.len());
+    // }
+
+    #[test]
+    fn mk_tree() -> anyhow::Result<()> {
+        let store = Store::default();
+        let mut leafs = (1u64..).map(|i| {
+            // 8 kb unique data
+            i.to_be_bytes().repeat(1024)
+        });
+        let root = make_tree(&store, 10, 4, &mut leafs)?.unwrap();
+        let bitmap = store.have(Query::new(root))?;
+        for r in store.want(Query::new(root)) {
+            println!("{:?}", r);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn two_peer_sync() -> anyhow::Result<()> {
+        let store1 = Store::default();
+        let store2 = Store::default();
+        let mut node1 = Node::new(store1.clone());
+        let mut node2 = Node::new(store2.clone());
+        let mut leafs = (1u64..).map(|i| {
+            // 8 kb unique data
+            i.to_be_bytes().repeat(1024)
+        });
+        let root = make_tree(&store1, 10, 2, &mut leafs)?.unwrap();
+        node2.add_peer(0, Box::new(node1));
+        let mut stream = node2.sync(Query::new(root)).await?;
+        while let Some(_) = stream.next().await {
+            print!(".");
+        }
         Ok(())
     }
 }

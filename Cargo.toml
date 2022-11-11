@@ -8,9 +8,13 @@ edition = "2021"
 [dependencies]
 ahash = "0.8.1"
 anyhow = "1.0.66"
+async-stream = "0.3.3"
 bitvec = "1.0.1"
 bytes = "1.2.1"
 cid = "0.8.6"
+futures = "0.3.25"
+hex = "0.4.3"
 libipld = "0.14.0"
 multihash = "0.16.3"
 parking_lot = "0.12.1"
+tokio = { version = "1.21.2", features = ["full"] }
