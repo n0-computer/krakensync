@@ -1,15 +1,32 @@
 #![allow(clippy::type_complexity)]
 use ahash::{AHashMap, AHashSet};
-use async_stream::{stream, try_stream};
+use async_stream::try_stream;
 use bitvec::vec::BitVec;
 use bytes::Bytes;
 use cid::Cid;
 use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt};
 use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld};
-use multihash::MultihashDigest;
 use parking_lot::Mutex;
-use std::{fmt::Debug, hash::Hash, iter::FusedIterator, marker::PhantomData, sync::Arc};
-mod quinn;
+use serde::{Deserialize, Serialize};
+use std::{fmt::Debug, sync::Arc};
+mod network;
+mod proto;
+mod util;
+use proto::*;
+use util::limit;
+mod test_util;
+#[cfg(test)]
+mod tests;
+
+macro_rules! unwrap_or {
+    ($e:expr, $n:expr) => {
+        match $e {
+            Some(v) => v,
+            None => $n,
+        }
+    };
+}
+
 trait StoreRead {
     fn has(&self, cid: &Cid) -> anyhow::Result<bool>;
     fn get(&self, cid: &Cid) -> anyhow::Result<Option<(Bytes, Arc<[Cid]>)>>;
@@ -244,6 +261,7 @@ fn make_want(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     /// maximum number of blocks to send
     send_blocks: u64,
@@ -273,75 +291,6 @@ impl Default for Limits {
             read_bytes: 1000 * 1024 * 1024,
         }
     }
-}
-
-/// Transform an iterator like filter_map, but additionally perform limit calculations.
-///
-/// Limit is called on each item and can either skip items `Ok(None)`, emit items `Ok(Some(item))`, or
-/// terminate the iteration with an error value `Err(cause)` that will be the last element of the resulting
-/// iterator.
-///
-/// The function is a `FnMut` so it can decrement some limits and terminate once they are exceeded
-pub fn limit<I, R, F>(iter: I, f: F) -> Limit<I, F, R>
-where
-    I: Iterator,
-    F: FnMut(I::Item) -> std::result::Result<Option<R>, R>,
-{
-    Limit {
-        iter: Some(iter),
-        f,
-        _r: PhantomData,
-    }
-}
-
-pub struct Limit<I, F, R> {
-    iter: Option<I>,
-    f: F,
-    _r: PhantomData<R>,
-}
-
-impl<I, F, R> Iterator for Limit<I, F, R>
-where
-    I: Iterator,
-    F: FnMut(I::Item) -> std::result::Result<Option<R>, R>,
-{
-    type Item = R;
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let item = self.iter.as_mut()?.next()?;
-            match (self.f)(item) {
-                Ok(Some(r)) => {
-                    // limit not reached, return the result
-                    break Some(r);
-                }
-                Ok(None) => {
-                    // limit not reached, skip the item
-                    continue;
-                }
-                Err(r) => {
-                    // limit reached, stop iterating and return limit marker
-                    self.iter = None;
-                    break Some(r);
-                }
-            }
-        }
-    }
-}
-
-impl<I, F, R> FusedIterator for Limit<I, F, R>
-where
-    I: Iterator,
-    F: FnMut(I::Item) -> std::result::Result<Option<R>, R>,
-{
-}
-
-macro_rules! unwrap_or {
-    ($e:expr, $n:expr) => {
-        match $e {
-            Some(v) => v,
-            None => $n,
-        }
-    };
 }
 
 /// A depth first iterator over a dag, limited by a maximum depth and a set of already visited nodes.
@@ -501,169 +450,6 @@ impl<S: StoreRead> Iterator for BreadthFirstTraversal<S> {
     }
 }
 
-/// compact representation of a set of Cids
-///
-/// This could also be a probabilitic data structure like a bloom filter,
-/// with a moderate false positive rate.
-type CidSet = AHashSet<Cid>;
-
-/// bitmap of blocks to get
-type Bitmap = BitVec;
-
-#[derive(Debug, Default, Clone, Copy)]
-enum Traversal {
-    /// depth-first traversal
-    #[default]
-    DepthFirst = 0,
-    /// breadth-first traversal
-    BreadthFirst = 1,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    /// left to right
-    #[default]
-    LeftToRight = 0,
-    // right to left
-    RightToLeft = 1,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct Query {
-    root: Cid,
-
-    /// cids to stop the traversal at (exclusive)
-    stop: CidSet,
-
-    /// depth of traversal
-    depth: u64,
-
-    /// traversal order
-    traversal: Traversal,
-
-    /// direction of traversal
-    direction: Direction,
-
-    /// bitmap of cids for which to send blocks
-    bits: Bitmap,
-}
-
-impl Query {
-    fn depth(self, depth: u64) -> Self {
-        Self { depth, ..self }
-    }
-
-    fn bits(self, bits: Bitmap) -> Self {
-        Self { bits, ..self }
-    }
-
-    fn stop(self, stop: AHashSet<Cid>) -> Self {
-        Self { stop, ..self }
-    }
-
-    fn direction(self, direction: Direction) -> Self {
-        Self { direction, ..self }
-    }
-
-    fn traversal(self, traversal: Traversal) -> Self {
-        Self { traversal, ..self }
-    }
-
-    fn new(root: Cid) -> Self {
-        Self {
-            root,
-            depth: u64::MAX,
-            traversal: Traversal::DepthFirst,
-            direction: Direction::LeftToRight,
-            bits: BitVec::repeat(true, 1024),
-            stop: AHashSet::new(),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct Block {
-    /// codec to use to reconstruct the Cid
-    codec: u64,
-    /// hash algo to use to reconstruct the Cid
-    hash: u64,
-    /// data of the block
-    data: Bytes,
-}
-
-impl Debug for Block {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Block")
-            .field("codec", &self.codec)
-            .field("hash", &self.hash)
-            .field("data", &self.data.len())
-            .finish()
-    }
-}
-
-impl Block {
-    fn new(cid: Cid, data: Bytes) -> Self {
-        Self {
-            codec: cid.codec(),
-            hash: cid.hash().code(),
-            data,
-        }
-    }
-
-    fn cid(&self) -> Cid {
-        let code = multihash::Code::try_from(self.hash).unwrap();
-        let hash = code.digest(&self.data);
-        Cid::new_v1(self.codec, hash)
-    }
-}
-
-/// Update of an ongoing request
-pub enum WantRequestUpdate {
-    /// Cancel values, e.g. if we got them already from another node
-    Cancel(Bitmap),
-    /// Request additional values, e.g. if another node has not delivered them
-    Add(Bitmap),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Want response
-pub enum WantResponse {
-    /// Got a block.
-    Block(usize, Block),
-    /// Did not find a cid.
-    NotFound(usize, Cid),
-    /// We did not find a block and were unable to keep track of the index. Stream ends.
-    StopNotFound(usize, Cid),
-    /// Max blocks exceeded. Stream ends.
-    MaxBlocksSent,
-    /// Max bytes exceeded. Stream ends.
-    MaxBytesSent,
-    /// Max blocks exceeded. Stream ends.
-    MaxBlocksRead,
-    /// Max bytes exceeded. Stream ends.
-    MaxBytesRead,
-    /// Internal error in the store. Stream ends.
-    InternalError(String),
-}
-
-impl WantResponse {
-    fn internal_error(error: anyhow::Error) -> Self {
-        Self::InternalError(error.to_string())
-    }
-}
-
-#[derive(Debug)]
-struct HaveResponse {
-    bitmap: BitVec,
-    stop: Option<Cid>,
-}
-
-impl HaveResponse {
-    fn is_complete(&self) -> bool {
-        self.stop.is_none() && self.bitmap.all() && !self.bitmap.is_empty()
-    }
-}
-
 trait SyncApi: Debug + Send + Sync + 'static {
     fn have(&self, query: Query) -> BoxFuture<anyhow::Result<HaveResponse>>;
     fn want(
@@ -776,283 +562,7 @@ impl Node {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    quinn::main().await.unwrap();
-    Ok(())
-}
-#[cfg(test)]
-#[allow(clippy::redundant_clone)]
-mod tests {
-    use super::*;
-    use cid::Cid;
-    use libipld::{cbor::DagCborCodec, ipld, prelude::Codec, Ipld};
-    use multihash::MultihashDigest;
-
-    fn parse_bits(bits: &str) -> anyhow::Result<BitVec> {
-        let bits = bits
-            .chars()
-            .map(|c| match c {
-                '0' => Ok(false),
-                '1' => Ok(true),
-                _ => Err(anyhow::anyhow!("invalid bit")),
-            })
-            .collect::<anyhow::Result<_>>()?;
-        Ok(bits)
-    }
-
-    trait StoreWriteExt: StoreWrite {
-        fn write_raw(&self, data: &[u8]) -> anyhow::Result<Cid> {
-            let hash = multihash::Code::Sha2_256.digest(&data);
-            let cid = Cid::new_v1(0x55, hash);
-            self.put(&cid, data, &[])?;
-            Ok(cid)
-        }
-
-        fn write_ipld(&self, ipld: Ipld) -> anyhow::Result<Cid> {
-            let bytes = DagCborCodec.encode(&ipld).unwrap();
-            let hash = multihash::Code::Sha2_256.digest(&bytes);
-            let cid = Cid::new_v1(0x55, hash);
-            let mut links = Vec::new();
-            ipld.references(&mut links);
-            self.put(&cid, &bytes, &links)?;
-            Ok(cid)
-        }
-    }
-
-    impl<S: StoreWrite> StoreWriteExt for S {}
-
-    // Make a tree given tree parameters and an iterator of leafs
-    fn make_tree(
-        store: &Store,
-        branches: usize,
-        depth: usize,
-        leaf: &mut impl Iterator<Item = Vec<u8>>,
-    ) -> anyhow::Result<Option<Cid>> {
-        if depth == 0 {
-            leaf.next().map(|data| store.write_raw(&data)).transpose()
-        } else {
-            let mut links = Vec::new();
-            for i in 0..branches {
-                if let Some(cid) = make_tree(store, branches, depth - 1, leaf)? {
-                    links.push(Ipld::Link(cid));
-                }
-            }
-            Ok(if !links.is_empty() {
-                Some(store.write_ipld(Ipld::List(links))?)
-            } else {
-                None
-            })
-        }
-    }
-
-    /// basically like a want response, but cid instead of block
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum WantResponseShort {
-        Block(Cid),
-        NotFound(Cid),
-        StopNotFound(Cid),
-        MaxBlocks,
-        MaxBytes,
-        InternalError(String),
-    }
-
-    fn short(response: WantResponse) -> WantResponseShort {
-        match response {
-            WantResponse::Block(_, block) => WantResponseShort::Block(block.cid()),
-            WantResponse::NotFound(_, cid) => WantResponseShort::NotFound(cid),
-            WantResponse::StopNotFound(_, cid) => WantResponseShort::StopNotFound(cid),
-            WantResponse::MaxBlocksRead => WantResponseShort::MaxBlocks,
-            WantResponse::MaxBytesRead => WantResponseShort::MaxBytes,
-            WantResponse::MaxBlocksSent => WantResponseShort::MaxBlocks,
-            WantResponse::MaxBytesSent => WantResponseShort::MaxBytes,
-            WantResponse::InternalError(x) => WantResponseShort::InternalError(x),
-        }
-    }
-
-    #[test]
-    #[rustfmt::skip]
-    fn smoke() -> anyhow::Result<()> {
-        use Direction::*;
-        use Traversal::*;
-        use WantResponseShort::*;
-        let store = Store::default();
-
-        // small helper to reduce test boilerplate
-        let have = |q: &Query| anyhow::Ok(store.have(q.clone())?.bitmap);
-        let want = |q: &Query| store.clone().want(q.clone()).map(short).collect::<Vec<_>>();
-
-        let a = store.write_raw(b"abcd")?;
-        let b = store.write_raw(b"efgh")?;
-        let c = store.write_raw(b"ijkl")?;
-        let d = store.write_raw(b"mnop")?;
-        let b0 = store.write_ipld(ipld! {{
-            "aaaaaaaa": a,
-            "bbbbbbbb": b,
-        }})?;
-        let b1 = store.write_ipld(ipld! {{
-            "cccccccc": c,
-            "dddddddd": d,
-        }})?;
-        let r = store.write_ipld(ipld! {{
-            "b0": b0,
-            "b1": b1,
-        }})?;
-    
-        // create all the different queries
-        let df = Query::new(r).traversal(DepthFirst);
-        let dflr = df.clone().direction(LeftToRight);
-        let dfrl = df.clone().direction(RightToLeft);
-        let bf = Query::new(r).traversal(BreadthFirst);
-        let bflr = bf.clone().direction(LeftToRight);
-        let bfrl = bf.clone().direction(RightToLeft);
-
-        let dflr = dflr.depth(0);
-        let dfrl = dfrl.depth(0);
-        let bflr = bflr.depth(0);
-        let bfrl = bfrl.depth(0);
-
-        assert_eq!(have(&dflr)?, parse_bits("1")?);
-        assert_eq!(have(&dfrl)?, parse_bits("1")?);
-        assert_eq!(have(&bflr)?, parse_bits("1")?);
-        assert_eq!(have(&bfrl)?, parse_bits("1")?);
-
-        assert_eq!(want(&dflr), vec![Block(r)]);
-        assert_eq!(want(&dfrl), vec![Block(r)]);
-        assert_eq!(want(&bflr), vec![Block(r)]);
-        assert_eq!(want(&bfrl), vec![Block(r)]);
-
-        let dflr = dflr.depth(1);
-        let dfrl = dfrl.depth(1);
-        let bflr = bflr.depth(1);
-        let bfrl = bfrl.depth(1);
-
-        assert_eq!(have(&dflr)?, parse_bits("111")?);
-        assert_eq!(have(&dfrl)?, parse_bits("111")?);
-        assert_eq!(have(&bflr)?, parse_bits("111")?);
-        assert_eq!(have(&bfrl)?, parse_bits("111")?);
-
-        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(b1)]);
-        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), Block(b0)]);
-        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1)]);
-        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0)]);
-
-        let dflr = dflr.depth(2);
-        let dfrl = dfrl.depth(2);
-        let bflr = bflr.depth(2);
-        let bfrl = bfrl.depth(2);
-
-        assert_eq!(have(&dflr)?, parse_bits("1111111")?);
-        assert_eq!(have(&dfrl)?, parse_bits("1111111")?);
-        assert_eq!(have(&bflr)?, parse_bits("1111111")?);
-        assert_eq!(have(&bfrl)?, parse_bits("1111111")?);
-
-        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(a), Block(b), Block(b1), Block(c), Block(d)]);
-        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), Block(d), Block(c), Block(b0), Block(b), Block(a)]);
-        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), Block(a), Block(b), Block(c), Block(d)]);
-        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), Block(d), Block(c), Block(b), Block(a)]);
-
-        store.delete(&d)?;
-        assert_eq!(have(&dflr)?, parse_bits("1111110")?);
-        assert_eq!(have(&dfrl)?, parse_bits("1101111")?);
-        assert_eq!(have(&bflr)?, parse_bits("1111110")?);
-        assert_eq!(have(&bfrl)?, parse_bits("1110111")?);
-
-        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(a), Block(b), Block(b1), Block(c), NotFound(d)]);
-        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), NotFound(d), Block(c), Block(b0), Block(b), Block(a)]);
-        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), Block(a), Block(b), Block(c), NotFound(d)]);
-        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), NotFound(d), Block(c), Block(b), Block(a)]);
-
-        store.delete(&b)?;
-        assert_eq!(have(&dflr)?, parse_bits("1110110")?);
-        assert_eq!(have(&dfrl)?, parse_bits("1101101")?);
-        assert_eq!(have(&bflr)?, parse_bits("1111010")?);
-        assert_eq!(have(&bfrl)?, parse_bits("1110101")?);
-
-        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(a), NotFound(b), Block(b1), Block(c), NotFound(d)]);
-        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), NotFound(d), Block(c), Block(b0), NotFound(b), Block(a)]);
-        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), Block(a), NotFound(b), Block(c), NotFound(d)]);
-        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), NotFound(d), Block(c), NotFound(b), Block(a)]);
-
-        store.delete(&c)?;
-        assert_eq!(have(&dflr)?, parse_bits("1110100")?);
-        assert_eq!(have(&dfrl)?, parse_bits("1100101")?);
-        assert_eq!(have(&bflr)?, parse_bits("1111000")?);
-        assert_eq!(have(&bfrl)?, parse_bits("1110001")?);
-
-        assert_eq!(want(&dflr), vec![Block(r), Block(b0), Block(a), NotFound(b), Block(b1), NotFound(c), NotFound(d)]);
-        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), NotFound(d), NotFound(c), Block(b0), NotFound(b), Block(a)]);
-        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), Block(a), NotFound(b), NotFound(c), NotFound(d)]);
-        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), NotFound(d), NotFound(c), NotFound(b), Block(a)]);
-
-        store.delete(&a)?;
-        assert_eq!(have(&dflr)?, parse_bits("1100100")?);
-        assert_eq!(have(&dfrl)?, parse_bits("1100100")?);
-        assert_eq!(have(&bflr)?, parse_bits("1110000")?);
-        assert_eq!(have(&bfrl)?, parse_bits("1110000")?);
-
-        assert_eq!(want(&dflr), vec![Block(r), Block(b0), NotFound(a), NotFound(b), Block(b1), NotFound(c), NotFound(d)]);
-        assert_eq!(want(&dfrl), vec![Block(r), Block(b1), NotFound(d), NotFound(c), Block(b0), NotFound(b), NotFound(a)]);
-        assert_eq!(want(&bflr), vec![Block(r), Block(b0), Block(b1), NotFound(a), NotFound(b), NotFound(c), NotFound(d)]);
-        assert_eq!(want(&bfrl), vec![Block(r), Block(b1), Block(b0), NotFound(d), NotFound(c), NotFound(b), NotFound(a)]);
-
-        store.delete(&b1)?;
-        // b1 is gone, so with a left to right traversal, we have to give up after b0's children
-        assert_eq!(have(&dflr)?, parse_bits("1100")?);
-        // b1 is gone, so with a right to left traversal, we have to give up early
-        assert_eq!(have(&dfrl)?, parse_bits("1")?);
-        // r and b0 are there. b1 is gone. But we can still enumerate the children of b0 before breaking order
-        assert_eq!(have(&bflr)?, parse_bits("11000")?);
-        // r and b0 are there. b1 is gone. Because of rtl we can't enumerate the children of b0 before breaking order
-        assert_eq!(have(&bfrl)?, parse_bits("101")?);
-
-        assert_eq!(want(&dflr), vec![Block(r), Block(b0), NotFound(a), NotFound(b), StopNotFound(b1)]);
-        assert_eq!(want(&dfrl), vec![Block(r), StopNotFound(b1)]);
-        assert_eq!(want(&bflr), vec![Block(r), Block(b0), NotFound(b1), NotFound(a), NotFound(b), StopNotFound(b1)]);
-        assert_eq!(want(&bfrl), vec![Block(r), NotFound(b1), Block(b0), StopNotFound(b1)]);
-        Ok(())
-    }
-
-    // #[test]
-    // fn deflate() {
-    //     let data = [
-    //         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    //         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    //         1, 1, 1, 1, 1, 1,
-    //     ];
-    //     let def = lz4_flex::compress(&data);
-    //     println!("deflated: {:?}", def.len());
-    // }
-
-    #[test]
-    fn mk_tree() -> anyhow::Result<()> {
-        let store = Store::default();
-        let mut leafs = (1u64..).map(|i| {
-            // 8 kb unique data
-            i.to_be_bytes().repeat(1024)
-        });
-        let root = make_tree(&store, 10, 4, &mut leafs)?.unwrap();
-        let bitmap = store.have(Query::new(root))?;
-        for r in store.want(Query::new(root)) {
-            println!("{:?}", r);
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn two_peer_sync() -> anyhow::Result<()> {
-        let store1 = Store::default();
-        let store2 = Store::default();
-        let mut node1 = Node::new(store1.clone());
-        let mut node2 = Node::new(store2.clone());
-        let mut leafs = (1u64..).map(|i| {
-            // 8 kb unique data
-            i.to_be_bytes().repeat(1024)
-        });
-        let root = make_tree(&store1, 10, 2, &mut leafs)?.unwrap();
-        node2.add_peer(0, Box::new(node1));
-        let mut stream = node2.sync(Query::new(root)).await?;
-        while let Some(_) = stream.next().await {
-            print!(".");
-        }
-        Ok(())
-    }
+    tracing_subscriber::fmt::init();
+    network::sync_demo().await
+    // network::main().await
 }
