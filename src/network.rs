@@ -260,7 +260,7 @@ impl Node {
         Ok(())
     }
 
-    pub fn sync(&self, query: Query) -> impl Stream<Item = anyhow::Result<()>> + '_ {
+    pub fn sync(&self, query: Query) -> impl Stream<Item = anyhow::Result<(usize, usize)>> + '_ {
         println!("syncing {}", query.root);
         try_stream! {
             loop {
@@ -269,6 +269,9 @@ impl Node {
                 if mine.is_complete() {
                     break;
                 }
+                let total = mine.bitmap.len();
+                let have = mine.bitmap.iter().filter(|b| **b).count();
+                yield (have, total + 1);
                 if let Some(peer) = peers.first() {
                     let mut query = query.clone();
                     query.bits = !mine.bitmap.clone();
@@ -303,7 +306,6 @@ impl Node {
                         }
                     }
                 }
-                yield ();
             }
         }
         .boxed()
@@ -332,8 +334,21 @@ async fn make_client(endpoint: Endpoint, server_addr: SocketAddr) -> anyhow::Res
     Ok(())
 }
 
+/// read hardcoded config for localhost
+fn read_localhost_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
+    let cert_der = include_bytes!("../certs/cert.der").to_vec();
+    let priv_key = include_bytes!("../certs/priv.key").to_vec();
+    let priv_key = rustls::PrivateKey(priv_key);
+    let cert_chain = vec![rustls::Certificate(cert_der.clone())];
+    let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
+    Arc::get_mut(&mut server_config.transport)
+        .unwrap()
+        .max_concurrent_uni_streams(0_u8.into());
+    Ok((server_config, cert_der))
+}
+
 pub async fn peer_sync_demo() -> anyhow::Result<()> {
-    let (server_config, server_cert) = configure_server()?;
+    let (server_config, server_cert) = read_localhost_config()?;
     let mut peer1 = Node::new(
         Store::default(),
         10001,
