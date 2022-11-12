@@ -1,7 +1,15 @@
 use anyhow::{Context, Ok};
-use futures::{stream::BoxStream, Sink, SinkExt, Stream, StreamExt};
+use async_stream::try_stream;
+use futures::{stream::BoxStream, FutureExt, Sink, SinkExt, Stream, StreamExt};
+use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld};
 use quinn::{ClientConfig, Connecting, Endpoint, ServerConfig};
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::Arc,
+};
+use tokio::task::JoinHandle;
 use tokio_serde::{formats::SymmetricalBincode, SymmetricallyFramed};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::info;
@@ -9,7 +17,7 @@ use tracing::info;
 use crate::{
     proto::{Query, Request, WantRequestUpdate, WantResponse},
     test_util::make_tree,
-    Store,
+    Store, StoreReadExt,
 };
 
 /// Constructs a QUIC endpoint configured for use a client only.
@@ -157,14 +165,19 @@ impl KrakenServer {
         query: Query,
         store: Store,
         mut send: impl Sink<WantResponse, Error = io::Error> + Unpin,
-        mut recv: impl Stream<Item = io::Result<WantRequestUpdate>> + Unpin,
+        mut recv: impl Stream<Item = io::Result<WantRequestUpdate>> + Send + Sync + Unpin + 'static,
     ) -> anyhow::Result<()> {
         tracing::info!("handling want");
-        send.send(WantResponse::InternalError("not implemented".into()))
-            .await?;
-        while let Some(recv) = recv.next().await {
-            let recv = recv?;
-            tracing::info!("got update: {:?}", recv);
+        tokio::spawn(async move {
+            while let Some(recv) = recv.next().await {
+                let recv = recv?;
+                tracing::info!("got update: {:?}", recv);
+            }
+            Ok(())
+        });
+        for item in store.want(query) {
+            tracing::info!("sending item: {:?}", item);
+            send.send(item).await?;
         }
         Ok(())
     }
@@ -209,6 +222,94 @@ impl KrakenClient {
     }
 }
 
+pub struct Node {
+    port: u16,
+    store: Store,
+    peers: BTreeMap<u16, KrakenClient>,
+    server: JoinHandle<anyhow::Result<()>>,
+    cert: Vec<u8>,
+}
+
+impl Node {
+    pub fn new(
+        store: Store,
+        port: u16,
+        server_config: ServerConfig,
+        cert: Vec<u8>,
+    ) -> anyhow::Result<Self> {
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        let endpoint = Endpoint::server(server_config, server_addr)?;
+        let server = KrakenServer::new(endpoint, store.clone());
+        let server = tokio::task::spawn(server.run());
+        Ok(Self {
+            port,
+            store,
+            peers: BTreeMap::new(),
+            server,
+            cert,
+        })
+    }
+
+    pub async fn connect(&mut self, port: u16) -> anyhow::Result<()> {
+        anyhow::ensure!(port != self.port, "cannot connect to self");
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        let endpoint = make_client_endpoint(bind_addr, &[&self.cert])?;
+        let client = KrakenClient::new(endpoint, server_addr, "localhost").await?;
+        self.peers.insert(port, client);
+        Ok(())
+    }
+
+    pub fn sync(&self, query: Query) -> impl Stream<Item = anyhow::Result<()>> + '_ {
+        println!("syncing {}", query.root);
+        try_stream! {
+            loop {
+                let peers = self.peers.values().collect::<Vec<_>>();
+                let mut mine = self.store.have(query.clone())?;
+                if mine.is_complete() {
+                    break;
+                }
+                if let Some(peer) = peers.first() {
+                    let mut query = query.clone();
+                    query.bits = !mine.bitmap.clone();
+                    query.bits.extend((0..1024).map(|_| true));
+                    let (_sink, mut stream) = peer.want(query).await?;
+                    while let Some(response) = stream.next().await {
+                        match response? {
+                            WantResponse::Block(index, block) => {
+                                let cid = block.cid();
+                                let mut links = Vec::new();
+                                DagCborCodec.references::<Ipld, _>(&block.data, &mut links)?;
+                                println!("got block {} {} {}", index, cid, links.len());
+                                self.store.put(cid, block.data, links.into())?;
+                                if index < mine.bitmap.len() {
+                                    mine.bitmap.set(index, true);
+                                }
+                            }
+                            WantResponse::NotFound(index, cid) => {
+                            }
+                            WantResponse::StopNotFound(index, cid) => {
+                            }
+                            WantResponse::MaxBlocksSent => {
+                            }
+                            WantResponse::MaxBytesSent => {
+                            }
+                            WantResponse::MaxBlocksRead => {
+                            }
+                            WantResponse::MaxBytesRead => {
+                            }
+                            WantResponse::InternalError(error) => {
+                            }
+                        }
+                    }
+                }
+                yield ();
+            }
+        }
+        .boxed()
+    }
+}
+
 async fn make_client(endpoint: Endpoint, server_addr: SocketAddr) -> anyhow::Result<()> {
     let connection = endpoint.connect(server_addr, "localhost")?.await?;
     tracing::info!("[client] connected: addr={}", connection.remote_address());
@@ -228,6 +329,35 @@ async fn make_client(endpoint: Endpoint, server_addr: SocketAddr) -> anyhow::Res
 
     // Give the server has a chance to clean up
     endpoint.wait_idle().await;
+    Ok(())
+}
+
+pub async fn peer_sync_demo() -> anyhow::Result<()> {
+    let (server_config, server_cert) = configure_server()?;
+    let mut peer1 = Node::new(
+        Store::default(),
+        10001,
+        server_config.clone(),
+        server_cert.clone(),
+    )?;
+    let mut peer2 = Node::new(
+        Store::default(),
+        10002,
+        server_config.clone(),
+        server_cert.clone(),
+    )?;
+    peer1.connect(peer2.port).await?;
+    peer2.connect(peer1.port).await?;
+    let mut leafs = (1u64..).map(|i| {
+        // 8 kb unique data
+        i.to_be_bytes().repeat(1024)
+    });
+    let root = make_tree(&peer1.store, 10, 2, &mut leafs)?.unwrap();
+    let mut progress = peer2.sync(Query::new(root));
+    while let Some(update) = progress.next().await {
+        let update = update?;
+        println!("{:?}", update);
+    }
     Ok(())
 }
 

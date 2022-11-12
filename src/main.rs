@@ -563,6 +563,7 @@ impl Node {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    network::sync_demo().await
+    //network::sync_demo().await
+    network::peer_sync_demo().await
     // network::main().await
 }
