@@ -1,8 +1,6 @@
 #![allow(clippy::redundant_clone)]
 use super::*;
-use cid::Cid;
-use libipld::{cbor::DagCborCodec, ipld, prelude::Codec, Ipld};
-use multihash::MultihashDigest;
+use libipld::ipld;
 use test_util::*;
 
 #[test]

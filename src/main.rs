@@ -4,11 +4,12 @@ use async_stream::try_stream;
 use bitvec::vec::BitVec;
 use bytes::Bytes;
 use cid::Cid;
+use clap::Parser;
 use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt};
 use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, net::SocketAddr};
 mod network;
 mod proto;
 mod util;
@@ -27,12 +28,12 @@ macro_rules! unwrap_or {
     };
 }
 
-trait StoreRead {
+pub trait StoreRead {
     fn has(&self, cid: &Cid) -> anyhow::Result<bool>;
     fn get(&self, cid: &Cid) -> anyhow::Result<Option<(Bytes, Arc<[Cid]>)>>;
 }
 
-trait StoreWrite {
+pub trait StoreWrite {
     fn put(&self, cid: &Cid, data: &[u8], links: &[Cid]) -> anyhow::Result<()>;
     fn delete(&self, cid: &Cid) -> anyhow::Result<()>;
 }
@@ -560,10 +561,29 @@ impl Node {
     }
 }
 
+#[derive(Parser, Debug)]
+#[clap(name = "kraken")]
+struct Args {
+    #[arg(short, long, help = "port to listen on")]
+    port: Option<u16>,
+
+    #[arg(short, long, help = "addresses to connect to")]
+    connect: Vec<SocketAddr>,
+
+    #[arg(long, help = "data sets to create")]
+    create: Option<Vec<String>>,
+
+    #[arg(long, help = "roots to sync")]
+    #[arg(long, value_parser = clap::value_parser!(Cid))]
+    sync: Option<Vec<Cid>>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
     tracing_subscriber::fmt::init();
+    network::sync_peer(args).await
     //network::sync_demo().await
-    network::peer_sync_demo().await
+    // network::peer_sync_demo().await
     // network::main().await
 }

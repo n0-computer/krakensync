@@ -7,7 +7,7 @@ use std::{
     collections::BTreeMap,
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::Arc,
+    sync::Arc, time::Instant,
 };
 use tokio::task::JoinHandle;
 use tokio_serde::{formats::SymmetricalBincode, SymmetricallyFramed};
@@ -17,7 +17,7 @@ use tracing::info;
 use crate::{
     proto::{Query, Request, WantRequestUpdate, WantResponse},
     test_util::make_tree,
-    Store, StoreReadExt,
+    Store, StoreReadExt, Args,
 };
 
 /// Constructs a QUIC endpoint configured for use a client only.
@@ -225,7 +225,7 @@ impl KrakenClient {
 pub struct Node {
     port: u16,
     store: Store,
-    peers: BTreeMap<u16, KrakenClient>,
+    peers: BTreeMap<SocketAddr, KrakenClient>,
     server: JoinHandle<anyhow::Result<()>>,
     cert: Vec<u8>,
 }
@@ -250,13 +250,17 @@ impl Node {
         })
     }
 
-    pub async fn connect(&mut self, port: u16) -> anyhow::Result<()> {
+    pub async fn connect_local(&mut self, port: u16) -> anyhow::Result<()> {
         anyhow::ensure!(port != self.port, "cannot connect to self");
-        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        self.connect(server_addr).await
+    }
+
+    pub async fn connect(&mut self, remote_addr: SocketAddr) -> anyhow::Result<()> {
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         let endpoint = make_client_endpoint(bind_addr, &[&self.cert])?;
-        let client = KrakenClient::new(endpoint, server_addr, "localhost").await?;
-        self.peers.insert(port, client);
+        let client = KrakenClient::new(endpoint, remote_addr, "localhost").await?;
+        self.peers.insert(remote_addr, client);
         Ok(())
     }
 
@@ -347,7 +351,57 @@ fn read_localhost_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
     Ok((server_config, cert_der))
 }
 
-pub async fn peer_sync_demo() -> anyhow::Result<()> {
+pub(crate) async fn sync_peer(args: Args) -> anyhow::Result<()> {
+    let (server_config, server_cert) = read_localhost_config()?;
+    let store = Store::default();
+    // create some data sets to sync
+    if let Some(ss) = args.create {
+        for s in ss {
+            match s.as_str() {
+                "tree" => {
+                    let mut leafs = (1u64..).map(|i| {
+                        // 8 kb data, unique for each leaf
+                        i.to_be_bytes().repeat(1024)
+                    });
+                    let root = make_tree(&store, 10, 2, &mut leafs)?.unwrap();
+                    println!("created dataset {}: {}", s, root);
+                }
+                _ => {
+                    anyhow::bail!("unknown dataset {}", s);
+                }
+            }
+        }
+    }
+    let port = args.port.unwrap_or(31337);
+    println!("listening on port {}", port);
+    let mut peer = Node::new(
+        store,
+        port,
+        server_config.clone(),
+        server_cert.clone(),
+    )?;
+    for addr in args.connect {
+        println!("connecting to {:?}...", addr);
+        peer.connect(addr).await?;
+        println!("done");
+    }
+    if let Some(sync) = args.sync {
+        for root in sync {
+            println!("syncing {}...", root);
+            let t0 = Instant::now();
+            let mut updates = peer.sync(Query::new(root));
+            while let Some(update) = updates.next().await {
+                let (have, total) = update?;
+                println!("syncing {} {}/{}", root, have, total);
+            }
+            println!("syncing {} done in {}s", root, t0.elapsed().as_secs_f64());
+        }
+    }
+    futures::future::pending::<()>().await;
+    Ok(())
+}
+
+pub(crate) async fn peer_sync_demo() -> anyhow::Result<()> {
     let (server_config, server_cert) = read_localhost_config()?;
     let mut peer1 = Node::new(
         Store::default(),
@@ -361,8 +415,8 @@ pub async fn peer_sync_demo() -> anyhow::Result<()> {
         server_config.clone(),
         server_cert.clone(),
     )?;
-    peer1.connect(peer2.port).await?;
-    peer2.connect(peer1.port).await?;
+    peer1.connect_local(10002).await?;
+    peer2.connect_local(10001).await?;
     let mut leafs = (1u64..).map(|i| {
         // 8 kb unique data
         i.to_be_bytes().repeat(1024)
