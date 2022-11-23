@@ -1,23 +1,23 @@
 use anyhow::{Context, Ok};
 use async_stream::try_stream;
-use futures::{stream::BoxStream, FutureExt, Sink, SinkExt, Stream, StreamExt};
+use futures::{stream::BoxStream, Sink, SinkExt, Stream, StreamExt};
 use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld};
 use quinn::{ClientConfig, Connecting, Endpoint, ServerConfig};
 use std::{
     collections::BTreeMap,
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::Arc, time::Instant,
+    sync::Arc,
+    time::Instant,
 };
 use tokio::task::JoinHandle;
 use tokio_serde::{formats::SymmetricalBincode, SymmetricallyFramed};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-use tracing::info;
 
 use crate::{
+    core::{Args, Store, StoreReadExt},
     proto::{Query, Request, WantRequestUpdate, WantResponse},
     test_util::make_tree,
-    Store, StoreReadExt, Args,
 };
 
 /// Constructs a QUIC endpoint configured for use a client only.
@@ -66,7 +66,7 @@ fn configure_client(server_certs: &[&[u8]]) -> anyhow::Result<ClientConfig> {
 
 /// Returns default server configuration along with its certificate.
 #[allow(clippy::field_reassign_with_default)] // https://github.com/rust-lang/rust-clippy/issues/6527
-fn configure_server() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
+pub fn configure_server() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let cert_der = cert.serialize_der()?;
     let priv_key = cert.serialize_private_key_der();
@@ -351,7 +351,7 @@ fn read_localhost_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
     Ok((server_config, cert_der))
 }
 
-pub(crate) async fn sync_peer(args: Args) -> anyhow::Result<()> {
+pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     let (server_config, server_cert) = read_localhost_config()?;
     let store = Store::default();
     // create some data sets to sync
@@ -374,12 +374,7 @@ pub(crate) async fn sync_peer(args: Args) -> anyhow::Result<()> {
     }
     let port = args.port.unwrap_or(31337);
     println!("listening on port {}", port);
-    let mut peer = Node::new(
-        store,
-        port,
-        server_config.clone(),
-        server_cert.clone(),
-    )?;
+    let mut peer = Node::new(store, port, server_config.clone(), server_cert.clone())?;
     for addr in args.connect {
         println!("connecting to {:?}...", addr);
         peer.connect(addr).await?;
