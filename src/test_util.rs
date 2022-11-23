@@ -1,8 +1,11 @@
 #![allow(clippy::redundant_clone)]
-use super::*;
+use bitvec::prelude::BitVec;
 use cid::Cid;
-use libipld::{cbor::DagCborCodec, ipld, prelude::Codec, Ipld};
+use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld};
 use multihash::MultihashDigest;
+
+use crate::core::{Store, StoreWrite};
+use crate::proto::WantResponse;
 
 pub fn parse_bits(bits: &str) -> anyhow::Result<BitVec> {
     let bits = bits
