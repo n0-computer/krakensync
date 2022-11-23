@@ -36,6 +36,35 @@ pub fn make_client_endpoint(
     Ok(endpoint)
 }
 
+// insecure connection example from quinn-rs: https://github.com/quinn-rs/quinn/blob/369573482a1e716d3d7d47b2e74ab94cb1f88db5/quinn/examples/insecure_connection.rs
+// insecure connection example from quic-rs: https://github.com/n0-computer/quic-rpc/blob/1b17e92fb0d39df2204f22b31f50b4bfb5b837f0/examples/split/client/src/main.rs#L65
+pub fn make_insecure_client_endpoint(bind_addr: SocketAddr) -> anyhow::Result<Endpoint> {
+    let crypto = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+
+    let client_cfg = ClientConfig::new(Arc::new(crypto));
+    let mut endpoint = Endpoint::client(bind_addr)?;
+    endpoint.set_default_client_config(client_cfg);
+    Ok(endpoint)
+}
+
+struct SkipServerVerification;
+impl rustls::client::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        std::result::Result::Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
+
 /// Constructs a QUIC endpoint configured to listen for incoming connections on a certain address
 /// and port.
 ///
@@ -259,6 +288,14 @@ impl Node {
     pub async fn connect(&mut self, remote_addr: SocketAddr) -> anyhow::Result<()> {
         let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
         let endpoint = make_client_endpoint(bind_addr, &[&self.cert])?;
+        let client = KrakenClient::new(endpoint, remote_addr, "localhost").await?;
+        self.peers.insert(remote_addr, client);
+        Ok(())
+    }
+
+    pub async fn insecure_connect(&mut self, remote_addr: SocketAddr) -> anyhow::Result<()> {
+        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        let endpoint = make_insecure_client_endpoint(bind_addr)?;
         let client = KrakenClient::new(endpoint, remote_addr, "localhost").await?;
         self.peers.insert(remote_addr, client);
         Ok(())
