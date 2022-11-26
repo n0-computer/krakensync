@@ -1,7 +1,8 @@
 pub mod core;
 pub mod network;
 mod proto;
-mod test_util;
+pub mod test_util;
 #[cfg(test)]
 mod tests;
 mod util;
+pub use proto::Query;
