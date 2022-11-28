@@ -264,11 +264,11 @@ pub struct Node {
 impl Node {
     pub fn new(
         store: Store,
-        port: u16,
+        server_addr: SocketAddr,
         server_config: ServerConfig,
         cert: Vec<u8>,
     ) -> anyhow::Result<Self> {
-        let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        let port = server_addr.port();
         let endpoint = Endpoint::server(server_config, server_addr)?;
         let server = KrakenServer::new(endpoint, store.clone());
         let server = tokio::task::spawn(server.run());
@@ -511,7 +511,13 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     }
     let port = args.port.unwrap_or(31337);
     println!("listening on port {}", port);
-    let mut peer = Node::new(store, port, server_config.clone(), server_cert.clone())?;
+    let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let mut peer = Node::new(
+        store,
+        server_addr,
+        server_config.clone(),
+        server_cert.clone(),
+    )?;
     for addr in args.connect {
         println!("connecting to {:?}...", addr);
         peer.connect(addr).await?;
@@ -535,15 +541,19 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
 
 pub(crate) async fn peer_sync_demo() -> anyhow::Result<()> {
     let (server_config, server_cert) = read_localhost_config()?;
+
+    let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 10001));
     let mut peer1 = Node::new(
         Store::default(),
-        10001,
+        server_addr,
         server_config.clone(),
         server_cert.clone(),
     )?;
+
+    let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 10002));
     let mut peer2 = Node::new(
         Store::default(),
-        10002,
+        server_addr,
         server_config.clone(),
         server_cert.clone(),
     )?;
