@@ -447,7 +447,7 @@ impl<S: StoreRead> Iterator for BreadthFirstTraversal<S> {
     }
 }
 
-trait SyncApi: Debug + Send + Sync + 'static {
+pub(crate) trait SyncApi: Debug + Send + Sync + 'static {
     fn have(&self, query: Query) -> BoxFuture<anyhow::Result<HaveResponse>>;
     fn want(
         &self,
@@ -471,7 +471,7 @@ impl SyncApi for Box<dyn SyncApi> {
 }
 
 #[derive(Debug)]
-struct Node {
+pub struct Node {
     peers: AHashMap<u64, Box<dyn SyncApi>>,
     store: Store,
 }
@@ -502,11 +502,11 @@ impl SyncApi for Node {
 }
 
 impl Node {
-    fn add_peer(&mut self, id: u64, peer: Box<dyn SyncApi>) {
+    pub(crate) fn add_peer(&mut self, id: u64, peer: Box<dyn SyncApi>) {
         self.peers.insert(id, peer);
     }
 
-    fn sync(&self, query: Query) -> BoxFuture<anyhow::Result<BoxStream<anyhow::Result<()>>>> {
+    pub(crate) fn sync(&self, query: Query) -> BoxFuture<anyhow::Result<BoxStream<anyhow::Result<()>>>> {
         println!("syncing {}", query.root);
         let s = try_stream! {
             loop {
@@ -568,6 +568,9 @@ pub struct Args {
 
     #[arg(long, help = "data sets to create")]
     pub(crate) create: Option<Vec<String>>,
+
+    #[arg(long, help = "data sets to import from car files")]
+    pub(crate) import: Option<Vec<String>>,
 
     #[arg(long, help = "roots to sync")]
     #[arg(long, value_parser = clap::value_parser!(Cid))]

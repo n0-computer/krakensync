@@ -376,7 +376,7 @@ async fn make_client(endpoint: Endpoint, server_addr: SocketAddr) -> anyhow::Res
 }
 
 /// read hardcoded config for localhost
-fn read_localhost_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
+pub fn read_localhost_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
     let cert_der = include_bytes!("../certs/cert.der").to_vec();
     let priv_key = include_bytes!("../certs/priv.key").to_vec();
     let priv_key = rustls::PrivateKey(priv_key);
@@ -407,6 +407,13 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
                     anyhow::bail!("unknown dataset {}", s);
                 }
             }
+        }
+    }
+    // import some data sets
+    if let Some(ss) = args.import {
+        for s in ss {
+            let file = std::fs::File::open(s)?;
+            
         }
     }
     let port = args.port.unwrap_or(31337);

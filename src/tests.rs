@@ -1,5 +1,8 @@
 #![allow(clippy::redundant_clone)]
+use crate::{proto::{Direction, Traversal, Query}, core::{Store, StoreReadExt, StoreWrite, Node}};
+
 use super::*;
+use futures::StreamExt;
 use libipld::ipld;
 use test_util::*;
 
