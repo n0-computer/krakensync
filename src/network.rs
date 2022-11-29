@@ -1,11 +1,13 @@
-use anyhow::{Context, Ok};
+use ahash::HashMapExt;
+use anyhow::{Context, Ok, bail};
 use async_stream::try_stream;
+use cid::Cid;
 use futures::{stream::BoxStream, Sink, SinkExt, Stream, StreamExt};
-use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld};
+use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld, IpldCodec};
 use quinn::{ClientConfig, Connecting, Endpoint, ServerConfig};
 use std::{
     collections::BTreeMap,
-    io,
+    io::{self, stdout, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::Arc,
     time::Instant,
@@ -388,6 +390,24 @@ pub fn read_localhost_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
     Ok((server_config, cert_der))
 }
 
+/// Extract links from the given content.
+///
+/// Links will be returned as a sorted vec
+pub fn parse_links(cid: &Cid, bytes: &[u8]) -> anyhow::Result<Vec<Cid>> {
+    let codec = cid.codec();
+    let mut cids = Vec::new();
+    let codec = match codec {
+        0x71 => IpldCodec::DagCbor,
+        0x70 => IpldCodec::DagPb,
+        0x0129 => IpldCodec::DagJson,
+        0x55 => IpldCodec::Raw,
+        _ => bail!("unsupported codec {:?}", codec),
+    };
+    codec.references::<Ipld, _>(bytes, &mut cids)?;
+    let links = cids.into_iter().collect();
+    Ok(links)
+}
+
 pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     let (server_config, server_cert) = read_localhost_config()?;
     let store = Store::default();
@@ -412,8 +432,55 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     // import some data sets
     if let Some(ss) = args.import {
         for s in ss {
-            let file = std::fs::File::open(s)?;
-            
+            let file = tokio::fs::File::open(&s).await?;
+            let reader = iroh_car::CarReader::new(file).await?;
+            let roots = reader.header().roots().to_vec();
+            for root in roots {
+                println!("importing root {} from {}", root, s);
+            }
+            let items = reader.stream().enumerate();
+            tokio::pin!(items);
+            let mut size_hist = BTreeMap::new();
+            let mut links_hist = BTreeMap::new();
+            let mut leaf_size = 0u64;
+            let mut branch_size = 0u64;
+            let mut leaf_count = 0u64;
+            let mut branch_count = 0u64;
+            while let Some((i, block)) = items.next().await {
+                if i % 1000 == 0 {
+                    print!("\r{}", i);
+                    stdout().flush()?;
+                }
+                let (cid, data) = block?;
+                let links = parse_links(&cid, &data)?;
+                let c = size_hist.entry(data.len()).or_insert(0u64);
+                *c += 1;
+                let c = links_hist.entry(links.len()).or_insert(0u64);
+                *c += 1;
+                if links.is_empty() {
+                    leaf_size += data.len() as u64;
+                    leaf_count += 1;
+                } else {
+                    branch_size += data.len() as u64;
+                    branch_count += 1;
+                }
+                store.put(cid, data.into(), links.into())?;
+            }
+            println!("\rdone!");
+            println!("size histogram:");
+            for (size, count) in size_hist {
+                println!("{}\t{}", size, count);
+            }
+            println!("links histogram:");
+            for (links, count) in links_hist {
+                println!("{}\t{}", links, count);
+            }
+            println!("branch size:\t{}", branch_size);
+            println!("branch count:\t{}", branch_count);
+            println!("leaf size:\t{}", leaf_size);
+            println!("leaf count:\t{}", leaf_count);
+            println!("total size:\t{}", branch_size + leaf_size);
+            println!("total count:\t{}", branch_count + leaf_count);
         }
     }
     let port = args.port.unwrap_or(31337);
