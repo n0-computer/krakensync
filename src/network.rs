@@ -1,5 +1,5 @@
 use ahash::HashMapExt;
-use anyhow::{Context, Ok, bail};
+use anyhow::{bail, Context, Ok};
 use async_stream::try_stream;
 use cid::Cid;
 use futures::{stream::BoxStream, Sink, SinkExt, Stream, StreamExt};
@@ -412,31 +412,16 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     let (server_config, server_cert) = read_localhost_config()?;
     let store = Store::default();
     // create some data sets to sync
-    if let Some(ss) = args.create {
-        for s in ss {
-            match s.as_str() {
-                "tree" => {
-                    let mut leafs = (1u64..).map(|i| {
-                        // 8 kb data, unique for each leaf
-                        i.to_be_bytes().repeat(1024)
-                    });
-                    let root = make_tree(&store, 10, 2, &mut leafs)?.unwrap();
-                    println!("created dataset {}: {}", s, root);
-                }
-                _ => {
-                    anyhow::bail!("unknown dataset {}", s);
-                }
-            }
-        }
-    }
+
     // import some data sets
-    if let Some(ss) = args.import {
+    if let Some(ss) = args.stats {
         for s in ss {
             let file = tokio::fs::File::open(&s).await?;
             let reader = iroh_car::CarReader::new(file).await?;
             let roots = reader.header().roots().to_vec();
+            println!("computing stats for {}", s);
             for root in roots {
-                println!("importing root {} from {}", root, s);
+                println!("root {}", root);
             }
             let items = reader.stream().enumerate();
             tokio::pin!(items);
@@ -481,6 +466,47 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
             println!("leaf count:\t{}", leaf_count);
             println!("total size:\t{}", branch_size + leaf_size);
             println!("total count:\t{}", branch_count + leaf_count);
+        }
+        return Ok(());
+    }
+    if let Some(ss) = args.create {
+        for s in ss {
+            match s.as_str() {
+                "tree" => {
+                    let mut leafs = (1u64..).map(|i| {
+                        // 8 kb data, unique for each leaf
+                        i.to_be_bytes().repeat(1024)
+                    });
+                    let root = make_tree(&store, 10, 2, &mut leafs)?.unwrap();
+                    println!("created dataset {}: {}", s, root);
+                }
+                _ => {
+                    anyhow::bail!("unknown dataset {}", s);
+                }
+            }
+        }
+    }
+    // import some data sets
+    if let Some(ss) = args.import {
+        for s in ss {
+            let file = tokio::fs::File::open(&s).await?;
+            let reader = iroh_car::CarReader::new(file).await?;
+            let roots = reader.header().roots().to_vec();
+            for root in roots {
+                println!("importing root {} from {}", root, s);
+            }
+            let items = reader.stream().enumerate();
+            tokio::pin!(items);
+            while let Some((i, block)) = items.next().await {
+                if i % 1000 == 0 {
+                    print!("\r{}", i);
+                    stdout().flush()?;
+                }
+                let (cid, data) = block?;
+                let links = parse_links(&cid, &data)?;
+                store.put(cid, data.into(), links.into())?;
+            }
+            println!("\rdone!");
         }
     }
     let port = args.port.unwrap_or(31337);

@@ -1,5 +1,8 @@
 #![allow(clippy::redundant_clone)]
-use crate::{proto::{Direction, Traversal, Query}, core::{Store, StoreReadExt, StoreWrite, Node}};
+use crate::{
+    core::{Node, Store, StoreReadExt, StoreWrite},
+    proto::{Direction, Query, Traversal},
+};
 
 use super::*;
 use futures::StreamExt;

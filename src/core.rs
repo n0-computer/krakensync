@@ -506,7 +506,10 @@ impl Node {
         self.peers.insert(id, peer);
     }
 
-    pub(crate) fn sync(&self, query: Query) -> BoxFuture<anyhow::Result<BoxStream<anyhow::Result<()>>>> {
+    pub(crate) fn sync(
+        &self,
+        query: Query,
+    ) -> BoxFuture<anyhow::Result<BoxStream<anyhow::Result<()>>>> {
         println!("syncing {}", query.root);
         let s = try_stream! {
             loop {
@@ -571,6 +574,9 @@ pub struct Args {
 
     #[arg(long, help = "data sets to import from car files")]
     pub(crate) import: Option<Vec<String>>,
+
+    #[arg(long, help = "data sets to compute stats for")]
+    pub(crate) stats: Option<Vec<String>>,
 
     #[arg(long, help = "roots to sync")]
     #[arg(long, value_parser = clap::value_parser!(Cid))]
