@@ -201,14 +201,12 @@ impl KrakenServer {
         tokio::spawn(async move {
             while let Some(recv) = recv.next().await {
                 let recv = recv?;
-                println!("MESSAGE_RECEIVED - got update: {:?}", recv);
-                tracing::info!("MESSAGE_RECEIVED - got update: {:?}", recv);
+                tracing::info!("got update: {:?}", recv);
             }
             Ok(())
         });
         for item in store.want(query) {
-            println!("MESSAGE_SENT - sending item: {:?}", item);
-            tracing::info!("MESSAGE_SENT - sending item: {:?}", item);
+            tracing::info!("sending item: {:?}", item);
             send.send(item).await?;
         }
         Ok(())
@@ -243,8 +241,6 @@ impl KrakenClient {
         let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
         let mut send = SymmetricallyFramed::new(send, SymmetricalBincode::<Request>::default());
         // send a want request
-        println!("MESSAGE_SENT - sending want request {:#?}", query);
-        tracing::info!("MESSAGE_SENT - sending want request {:#?}", query);
         send.send(Request::Want(query)).await?;
         let send = send.into_inner();
         // now switch to streams of WantRequestUpdate and WantResponse
@@ -318,19 +314,20 @@ impl Node {
                 let total = mine.bitmap.len();
                 let have = mine.bitmap.iter().filter(|b| **b).count();
                 yield (have, total + 1);
+                let mut messages_received = 0;
+                let mut messages_sent = 0;
                 if let Some(peer) = peers.first() {
                     let mut query = query.clone();
                     query.bits = !mine.bitmap.clone();
                     query.bits.extend((0..1024).map(|_| true));
                     let (_sink, mut stream) = peer.want(query).await?;
+                    messages_sent += 1;
                     while let Some(response) = stream.next().await {
-                        println!("MESSAGE_RECEIVED");
-                        tracing::info!("MESSAGE_RECEIVED");
+                        messages_received += 1;
                         match response? {
                             WantResponse::Block(index, block) => {
                                 if index == 0 {
-                                    println!("REQUESTER_TTFB {:?}", t0.elapsed().as_secs_f64());
-                                    tracing::info!("REQUESTER_TTFB {:?}", t0.elapsed().as_secs_f64());
+                                    println!("REQUESTER_TTFB {:?}", t0.elapsed().as_millis());
                                 }
                                 let cid = block.cid();
                                 let mut links = Vec::new();
@@ -358,8 +355,9 @@ impl Node {
                         }
                     }
 
-                    println!("REQUESTER_FETCH_DURATION {:?}", t0.elapsed().as_secs_f64());
-                    tracing::info!("REQUESTER_FETCH_DURATION {:?}", t0.elapsed().as_secs_f64());
+                    println!("REQUESTER_FETCH_DURATION {:?}", t0.elapsed().as_millis());
+                    println!("MESSAGES_RECEIVED={:?}", messages_received);
+                    println!("MESSAGES_SENT={:?}", messages_sent);
                 }
             }
         }
