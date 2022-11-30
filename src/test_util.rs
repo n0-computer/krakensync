@@ -21,8 +21,8 @@ pub fn parse_bits(bits: &str) -> anyhow::Result<BitVec> {
 
 pub trait StoreWriteExt: StoreWrite {
     fn write_raw(&self, data: &[u8]) -> anyhow::Result<Cid> {
-        let hash = multihash::Code::Sha2_256.digest(&data);
-        let cid = Cid::new_v1(0x55, hash);
+        let hash = multihash::Code::Sha2_256.digest(data);
+        let cid = Cid::new_v1(DagCborCodec.into(), hash);
         self.put(&cid, data, &[])?;
         Ok(cid)
     }
@@ -30,7 +30,7 @@ pub trait StoreWriteExt: StoreWrite {
     fn write_ipld(&self, ipld: Ipld) -> anyhow::Result<Cid> {
         let bytes = DagCborCodec.encode(&ipld).unwrap();
         let hash = multihash::Code::Sha2_256.digest(&bytes);
-        let cid = Cid::new_v1(0x55, hash);
+        let cid = Cid::new_v1(DagCborCodec.into(), hash);
         let mut links = Vec::new();
         ipld.references(&mut links);
         self.put(&cid, &bytes, &links)?;

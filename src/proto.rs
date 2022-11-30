@@ -67,9 +67,13 @@ impl Debug for Query {
             .field("depth", &self.depth)
             .field("traversal", &self.traversal)
             .field("direction", &self.direction)
-            .field("bits", &Dis(&self.bits))
+            .field("bits", &Dis(&fmt(&self.bits)))
             .finish()
     }
+}
+
+fn fmt(bits: &BitVec) -> String {
+    bits.iter().map(|b| if *b { '1' } else { '0' }).collect()
 }
 
 struct Dis<T>(T);
@@ -106,7 +110,7 @@ impl Query {
             depth: u64::MAX,
             traversal: Traversal::DepthFirst,
             direction: Direction::LeftToRight,
-            bits: BitVec::repeat(true, 1024),
+            bits: BitVec::repeat(true, 1024 * 64),
             stop: AHashSet::new(),
         }
     }

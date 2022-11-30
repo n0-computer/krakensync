@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     io::{self, stdout, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    path::Path,
     sync::Arc,
     time::Instant,
 };
@@ -167,29 +168,35 @@ impl KrakenServer {
             "[server] connection accepted: addr={}",
             conn.remote_address()
         );
-        let (send, recv) = conn.accept_bi().await?;
-        // turn chunks of bytes into a stream of messages using length delimited codec
-        let send = FramedWrite::new(send, LengthDelimitedCodec::new());
-        let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
-        let mut recv = SymmetricallyFramed::new(recv, SymmetricalBincode::<Request>::default());
-        let request = recv.next().await.context("no msg")??;
-        tracing::info!("got request: {:?}", request);
-        match request {
-            Request::Want(query) => {
-                let recv = recv.into_inner();
-                // now switch to streams of WantRequestUpdate and WantResponse
-                let recv = SymmetricallyFramed::new(
-                    recv,
-                    SymmetricalBincode::<WantRequestUpdate>::default(),
-                );
-                let send =
-                    SymmetricallyFramed::new(send, SymmetricalBincode::<WantResponse>::default());
-                Self::handle_want(query, store, send, recv).await
-            }
-            Request::Have(_query) => {
-                anyhow::bail!("not implemented");
+        loop {
+            let store = store.clone();
+            let (send, recv) = conn.accept_bi().await?;
+            // turn chunks of bytes into a stream of messages using length delimited codec
+            let send = FramedWrite::new(send, LengthDelimitedCodec::new());
+            let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
+            let mut recv = SymmetricallyFramed::new(recv, SymmetricalBincode::<Request>::default());
+            let request = recv.next().await.context("no msg")??;
+            tracing::info!("got request: {:?}", request);
+            match request {
+                Request::Want(query) => {
+                    let recv = recv.into_inner();
+                    // now switch to streams of WantRequestUpdate and WantResponse
+                    let recv = SymmetricallyFramed::new(
+                        recv,
+                        SymmetricalBincode::<WantRequestUpdate>::default(),
+                    );
+                    let send = SymmetricallyFramed::new(
+                        send,
+                        SymmetricalBincode::<WantResponse>::default(),
+                    );
+                    Self::handle_want(query, store, send, recv).await?;
+                }
+                Request::Have(_query) => {
+                    anyhow::bail!("not implemented");
+                }
             }
         }
+        Ok(())
     }
 
     async fn handle_want(
@@ -207,7 +214,11 @@ impl KrakenServer {
             Ok(())
         });
         for item in store.want(query) {
-            tracing::info!("sending item: {:?}", item);
+            if let WantResponse::Block(o, b) = &item {
+                tracing::info!("sending block: {}", b.cid());
+            } else {
+                tracing::info!("sending item: {:?}", item);
+            }
             send.send(item).await?;
         }
         Ok(())
@@ -324,8 +335,7 @@ impl Node {
                         match response? {
                             WantResponse::Block(index, block) => {
                                 let cid = block.cid();
-                                let mut links = Vec::new();
-                                DagCborCodec.references::<Ipld, _>(&block.data, &mut links)?;
+                                let links = parse_links(&cid, &block.data)?;
                                 println!("got block {} {} {}", index, cid, links.len());
                                 self.store.put(cid, block.data, links.into())?;
                                 if index < mine.bitmap.len() {
@@ -395,17 +405,26 @@ pub fn read_localhost_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
 /// Links will be returned as a sorted vec
 pub fn parse_links(cid: &Cid, bytes: &[u8]) -> anyhow::Result<Vec<Cid>> {
     let codec = cid.codec();
-    let mut cids = Vec::new();
-    let codec = match codec {
-        0x71 => IpldCodec::DagCbor,
-        0x70 => IpldCodec::DagPb,
-        0x0129 => IpldCodec::DagJson,
-        0x55 => IpldCodec::Raw,
-        _ => bail!("unsupported codec {:?}", codec),
-    };
-    codec.references::<Ipld, _>(bytes, &mut cids)?;
-    let links = cids.into_iter().collect();
+    let codec = IpldCodec::try_from(codec)?;
+    let mut links = Vec::new();
+    codec.references::<Ipld, _>(bytes, &mut links)?;
+    for link in links.iter_mut() {
+        *link = to_v1(link);
+    }
     Ok(links)
+}
+
+fn codec_name(codec: &IpldCodec) -> &str {
+    match codec {
+        IpldCodec::DagCbor => "dag-cbor",
+        IpldCodec::DagPb => "dag-pb",
+        IpldCodec::DagJson => "dag-json",
+        IpldCodec::Raw => "raw",
+    }
+}
+
+fn to_v1(cid: &Cid) -> Cid {
+    Cid::new(cid::Version::V1, cid.codec(), *cid.hash()).unwrap()
 }
 
 pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
@@ -431,6 +450,7 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
             let mut branch_size = 0u64;
             let mut leaf_count = 0u64;
             let mut branch_count = 0u64;
+            let mut link_count = 0u64;
             while let Some((i, block)) = items.next().await {
                 if i % 1000 == 0 {
                     print!("\r{}", i);
@@ -438,6 +458,7 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
                 }
                 let (cid, data) = block?;
                 let links = parse_links(&cid, &data)?;
+                link_count += links.len() as u64;
                 let c = size_hist.entry(data.len()).or_insert(0u64);
                 *c += 1;
                 let c = links_hist.entry(links.len()).or_insert(0u64);
@@ -451,21 +472,32 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
                 }
                 store.put(cid, data.into(), links.into())?;
             }
+            let stats = format!("{}.stats", s);
+            let stats = Path::new(&stats);
+            println!("removing {}", stats.display());
+            let _ = std::fs::remove_dir_all(stats);
+            println!("creating {}", stats.display());
+            std::fs::create_dir_all(stats)?;
             println!("\rdone!");
-            println!("size histogram:");
-            for (size, count) in size_hist {
-                println!("{}\t{}", size, count);
-            }
-            println!("links histogram:");
-            for (links, count) in links_hist {
-                println!("{}\t{}", links, count);
-            }
+            let size_hist = size_hist
+                .into_iter()
+                .map(|(k, v)| format!("{}\t{}", k, v))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(stats.join("size.hist"), size_hist)?;
+            let links_hist = links_hist
+                .into_iter()
+                .map(|(k, v)| format!("{}\t{}", k, v))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(stats.join("links.hist"), links_hist)?;
             println!("branch size:\t{}", branch_size);
             println!("branch count:\t{}", branch_count);
             println!("leaf size:\t{}", leaf_size);
             println!("leaf count:\t{}", leaf_count);
             println!("total size:\t{}", branch_size + leaf_size);
             println!("total count:\t{}", branch_count + leaf_count);
+            println!("link count:\t{}", link_count);
         }
         return Ok(());
     }
@@ -493,7 +525,7 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
             let reader = iroh_car::CarReader::new(file).await?;
             let roots = reader.header().roots().to_vec();
             for root in roots {
-                println!("importing root {} from {}", root, s);
+                println!("importing root {} as {} from {}", root, to_v1(&root), s);
             }
             let items = reader.stream().enumerate();
             tokio::pin!(items);
@@ -504,6 +536,7 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
                 }
                 let (cid, data) = block?;
                 let links = parse_links(&cid, &data)?;
+                let cid = to_v1(&cid);
                 store.put(cid, data.into(), links.into())?;
             }
             println!("\rdone!");
