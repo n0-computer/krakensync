@@ -1,4 +1,3 @@
-use ahash::HashMapExt;
 use anyhow::{bail, Context, Ok};
 use async_stream::try_stream;
 use cid::Cid;
@@ -202,12 +201,12 @@ impl KrakenServer {
         tokio::spawn(async move {
             while let Some(recv) = recv.next().await {
                 let recv = recv?;
-                tracing::info!("got update: {:?}", recv);
+                tracing::info!("MESSAGE_RECEIVED - got update: {:?}", recv);
             }
             Ok(())
         });
         for item in store.want(query) {
-            tracing::info!("sending item: {:?}", item);
+            tracing::info!("MESSAGE_SENT - sending item: {:?}", item);
             send.send(item).await?;
         }
         Ok(())
@@ -242,7 +241,7 @@ impl KrakenClient {
         let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
         let mut send = SymmetricallyFramed::new(send, SymmetricalBincode::<Request>::default());
         // send a want request
-        tracing::info!("sending want request {:#?}", query);
+        tracing::info!("MESSAGE_SENT - sending want request {:#?}", query);
         send.send(Request::Want(query)).await?;
         let send = send.into_inner();
         // now switch to streams of WantRequestUpdate and WantResponse
@@ -305,6 +304,7 @@ impl Node {
 
     pub fn sync(&self, query: Query) -> impl Stream<Item = anyhow::Result<(usize, usize)>> + '_ {
         println!("syncing {}", query.root);
+        let t0 = Instant::now();
         try_stream! {
             loop {
                 let peers = self.peers.values().collect::<Vec<_>>();
@@ -321,8 +321,12 @@ impl Node {
                     query.bits.extend((0..1024).map(|_| true));
                     let (_sink, mut stream) = peer.want(query).await?;
                     while let Some(response) = stream.next().await {
+                        tracing::info!("MESSAGE_RECEIVED");
                         match response? {
                             WantResponse::Block(index, block) => {
+                                if index == 0 {
+                                    tracing::info!("REQUESTER_TTFB {:?}", t0.elapsed().as_secs_f64());
+                                }
                                 let cid = block.cid();
                                 let mut links = Vec::new();
                                 DagCborCodec.references::<Ipld, _>(&block.data, &mut links)?;
@@ -348,6 +352,7 @@ impl Node {
                             }
                         }
                     }
+                    tracing::info!("REQUESTER_FETCH_DURATION {:?}", t0.elapsed().as_secs_f64());
                 }
             }
         }
