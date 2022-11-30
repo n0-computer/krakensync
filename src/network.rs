@@ -408,6 +408,50 @@ pub fn parse_links(cid: &Cid, bytes: &[u8]) -> anyhow::Result<Vec<Cid>> {
     Ok(links)
 }
 
+#[derive(Debug, Default)]
+pub struct CarImportStats {
+    pub size_hist: BTreeMap<usize, u64>,
+    pub links_hist: BTreeMap<usize, u64>,
+    pub leaf_size: u64,
+    pub branch_size: u64,
+    pub leaf_count: u64,
+    pub branch_count: u64,
+}
+
+pub async fn import_car_file(store: &Store, path: String) -> anyhow::Result<CarImportStats> {
+    let file = tokio::fs::File::open(&path).await?;
+    let reader = iroh_car::CarReader::new(file).await?;
+    let roots = reader.header().roots().to_vec();
+    println!("computing stats for {}", path);
+    for root in roots {
+        println!("root {}", root);
+    }
+    let items = reader.stream().enumerate();
+    tokio::pin!(items);
+    let mut stats = CarImportStats::default();
+    while let Some((i, block)) = items.next().await {
+        if i % 1000 == 0 {
+            print!("\r{}", i);
+            stdout().flush()?;
+        }
+        let (cid, data) = block?;
+        let links = parse_links(&cid, &data)?;
+        let c = stats.size_hist.entry(data.len()).or_insert(0u64);
+        *c += 1;
+        let c = stats.links_hist.entry(links.len()).or_insert(0u64);
+        *c += 1;
+        if links.is_empty() {
+            stats.leaf_size += data.len() as u64;
+            stats.leaf_count += 1;
+        } else {
+            stats.branch_size += data.len() as u64;
+            stats.branch_count += 1;
+        }
+        store.put(cid, data.into(), links.into())?;
+    }
+    Ok(stats)
+}
+
 pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     let (server_config, server_cert) = read_localhost_config()?;
     let store = Store::default();
@@ -416,56 +460,22 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     // import some data sets
     if let Some(ss) = args.stats {
         for s in ss {
-            let file = tokio::fs::File::open(&s).await?;
-            let reader = iroh_car::CarReader::new(file).await?;
-            let roots = reader.header().roots().to_vec();
-            println!("computing stats for {}", s);
-            for root in roots {
-                println!("root {}", root);
-            }
-            let items = reader.stream().enumerate();
-            tokio::pin!(items);
-            let mut size_hist = BTreeMap::new();
-            let mut links_hist = BTreeMap::new();
-            let mut leaf_size = 0u64;
-            let mut branch_size = 0u64;
-            let mut leaf_count = 0u64;
-            let mut branch_count = 0u64;
-            while let Some((i, block)) = items.next().await {
-                if i % 1000 == 0 {
-                    print!("\r{}", i);
-                    stdout().flush()?;
-                }
-                let (cid, data) = block?;
-                let links = parse_links(&cid, &data)?;
-                let c = size_hist.entry(data.len()).or_insert(0u64);
-                *c += 1;
-                let c = links_hist.entry(links.len()).or_insert(0u64);
-                *c += 1;
-                if links.is_empty() {
-                    leaf_size += data.len() as u64;
-                    leaf_count += 1;
-                } else {
-                    branch_size += data.len() as u64;
-                    branch_count += 1;
-                }
-                store.put(cid, data.into(), links.into())?;
-            }
+            let stats = import_car_file(&store, s).await?;
             println!("\rdone!");
             println!("size histogram:");
-            for (size, count) in size_hist {
+            for (size, count) in stats.size_hist {
                 println!("{}\t{}", size, count);
             }
             println!("links histogram:");
-            for (links, count) in links_hist {
+            for (links, count) in stats.links_hist {
                 println!("{}\t{}", links, count);
             }
-            println!("branch size:\t{}", branch_size);
-            println!("branch count:\t{}", branch_count);
-            println!("leaf size:\t{}", leaf_size);
-            println!("leaf count:\t{}", leaf_count);
-            println!("total size:\t{}", branch_size + leaf_size);
-            println!("total count:\t{}", branch_count + leaf_count);
+            println!("branch size:\t{}", stats.branch_size);
+            println!("branch count:\t{}", stats.branch_count);
+            println!("leaf size:\t{}", stats.leaf_size);
+            println!("leaf count:\t{}", stats.leaf_count);
+            println!("total size:\t{}", stats.branch_size + stats.leaf_size);
+            println!("total count:\t{}", stats.branch_count + stats.leaf_count);
         }
         return Ok(());
     }
