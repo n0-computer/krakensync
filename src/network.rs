@@ -418,12 +418,15 @@ pub struct CarImportStats {
     pub branch_count: u64,
 }
 
-pub async fn import_car_file(store: &Store, path: String) -> anyhow::Result<CarImportStats> {
+pub async fn import_car_file(
+    store: &Store,
+    path: String,
+) -> anyhow::Result<(Vec<Cid>, CarImportStats)> {
     let file = tokio::fs::File::open(&path).await?;
     let reader = iroh_car::CarReader::new(file).await?;
     let roots = reader.header().roots().to_vec();
     println!("computing stats for {}", path);
-    for root in roots {
+    for root in roots.clone() {
         println!("root {}", root);
     }
     let items = reader.stream().enumerate();
@@ -449,7 +452,7 @@ pub async fn import_car_file(store: &Store, path: String) -> anyhow::Result<CarI
         }
         store.put(cid, data.into(), links.into())?;
     }
-    Ok(stats)
+    Ok((roots, stats))
 }
 
 pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
@@ -460,7 +463,7 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     // import some data sets
     if let Some(ss) = args.stats {
         for s in ss {
-            let stats = import_car_file(&store, s).await?;
+            let (_, stats) = import_car_file(&store, s).await?;
             println!("\rdone!");
             println!("size histogram:");
             for (size, count) in stats.size_hist {
