@@ -201,11 +201,13 @@ impl KrakenServer {
         tokio::spawn(async move {
             while let Some(recv) = recv.next().await {
                 let recv = recv?;
+                println!("MESSAGE_RECEIVED - got update: {:?}", recv);
                 tracing::info!("MESSAGE_RECEIVED - got update: {:?}", recv);
             }
             Ok(())
         });
         for item in store.want(query) {
+            println!("MESSAGE_SENT - sending item: {:?}", item);
             tracing::info!("MESSAGE_SENT - sending item: {:?}", item);
             send.send(item).await?;
         }
@@ -241,6 +243,7 @@ impl KrakenClient {
         let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
         let mut send = SymmetricallyFramed::new(send, SymmetricalBincode::<Request>::default());
         // send a want request
+        println!("MESSAGE_SENT - sending want request {:#?}", query);
         tracing::info!("MESSAGE_SENT - sending want request {:#?}", query);
         send.send(Request::Want(query)).await?;
         let send = send.into_inner();
@@ -321,10 +324,12 @@ impl Node {
                     query.bits.extend((0..1024).map(|_| true));
                     let (_sink, mut stream) = peer.want(query).await?;
                     while let Some(response) = stream.next().await {
+                        println!("MESSAGE_RECEIVED");
                         tracing::info!("MESSAGE_RECEIVED");
                         match response? {
                             WantResponse::Block(index, block) => {
                                 if index == 0 {
+                                    println!("REQUESTER_TTFB {:?}", t0.elapsed().as_secs_f64());
                                     tracing::info!("REQUESTER_TTFB {:?}", t0.elapsed().as_secs_f64());
                                 }
                                 let cid = block.cid();
@@ -352,6 +357,8 @@ impl Node {
                             }
                         }
                     }
+
+                    println!("REQUESTER_FETCH_DURATION {:?}", t0.elapsed().as_secs_f64());
                     tracing::info!("REQUESTER_FETCH_DURATION {:?}", t0.elapsed().as_secs_f64());
                 }
             }
