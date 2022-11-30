@@ -284,8 +284,8 @@ impl Default for Limits {
         Limits {
             send_blocks: 10000,
             send_bytes: 1000 * 1024 * 1024,
-            read_blocks: 10000,
-            read_bytes: 1000 * 1024 * 1024,
+            read_blocks: 1024 * 1024,
+            read_bytes: 1024 * 1024 * 1024 * 1024,
         }
     }
 }

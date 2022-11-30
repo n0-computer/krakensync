@@ -73,7 +73,13 @@ impl Debug for Query {
 }
 
 fn fmt(bits: &BitVec) -> String {
-    bits.iter().map(|b| if *b { '1' } else { '0' }).collect()
+    let max_len = 128;
+    let text = bits.iter().take(max_len).map(|b| if *b { '1' } else { '0' }).collect();
+    if bits.len() > max_len {
+        format!("{}...", text)
+    } else {
+        text
+    }
 }
 
 struct Dis<T>(T);
