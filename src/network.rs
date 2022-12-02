@@ -470,7 +470,6 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
                     branch_size += data.len() as u64;
                     branch_count += 1;
                 }
-                store.put(cid, data.into(), links.into())?;
             }
             let stats = format!("{}.stats", s);
             let stats = Path::new(&stats);
