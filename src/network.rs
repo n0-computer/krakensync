@@ -166,28 +166,33 @@ impl RpcStore {
             while let Some(recv) = recv.next().await {
                 tracing::info!("got update: {:?}", recv);
             }
+            tracing::info!("no more want updates!");
             Ok(())
         });
         stream::iter(self.0.want(req.query)).map(|item| {
-            if let WantResponse::Block(_o, b) = &item {
-                tracing::info!("sending block: {}", b.cid());
+            if let WantResponse::Block(o, b) = &item {
+                tracing::info!("sending block: {} {}", o, b.cid());
             } else {
                 tracing::info!("sending item: {:?}", item);
             }
             item
+        }).filter(|_| async move {
+            // this is so we get backpressure
+            tokio::task::yield_now().await;
+            true
         })
     }
 }
 
 pub struct KrakenServer2 {
-    server: RpcServer<KrakenService, Http2ChannelTypes>,
-    store: Store,
     hyper_handle: JoinHandle<anyhow::Result<()>>,
+    handler_handle: JoinHandle<anyhow::Result<()>>,
 }
 
 impl Drop for KrakenServer2 {
     fn drop(&mut self) {
         self.hyper_handle.abort();
+        self.handler_handle.abort();
     }
 }
 
@@ -196,22 +201,25 @@ impl KrakenServer2 {
         let (channel, hyper) = ServerChannel::new(&addr)?;
         let hyper_handle = tokio::spawn(hyper.map_err(|x| anyhow::anyhow!(x)));
         let server = RpcServer::new(channel);
+        let handler_handle = tokio::task::spawn(Self::run(server, store));
         Ok(Self {
-            server,
-            store,
             hyper_handle,
+            handler_handle,
         })
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
+    async fn run(
+        server: RpcServer<KrakenService, Http2ChannelTypes>,
+        store: Store,
+    ) -> anyhow::Result<()> {
         loop {
-            let (req, c) = self.server.accept_one().await?;
-            let target = RpcStore(self.store.clone());
-            let s = self.server.clone();
-            match req {
+            let (req, c) = server.accept_one().await?;
+            let target = RpcStore(store.clone());
+            let s = server.clone();
+            let x = match req {
                 Request::Want(req) => {
                     s.bidi_streaming(req, c, target, RpcStore::handle_want)
-                        .await?;
+                        .await
                 }
                 Request::WantUpdate(_) => {
                     bail!("unexpected request");
@@ -219,6 +227,9 @@ impl KrakenServer2 {
                 Request::Have(_) => {
                     bail!("not implemented");
                 }
+            };
+            if let Err(cause) = x {
+                tracing::error!("error handling request: {}", cause);
             }
         }
         Ok(())
@@ -370,8 +381,8 @@ impl KrakenClient {
 pub struct Node {
     port: u16,
     store: Store,
-    peers: BTreeMap<SocketAddr, KrakenClient>,
-    server: JoinHandle<anyhow::Result<()>>,
+    peers: BTreeMap<SocketAddr, KrakenClient2>,
+    server: KrakenServer2,
     cert: Vec<u8>,
 }
 
@@ -383,9 +394,7 @@ impl Node {
         cert: Vec<u8>,
     ) -> anyhow::Result<Self> {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-        let endpoint = Endpoint::server(server_config, server_addr)?;
-        let server = KrakenServer::new(endpoint, store.clone());
-        let server = tokio::task::spawn(server.run());
+        let server = KrakenServer2::new(server_addr, store.clone())?;
         Ok(Self {
             port,
             store,
@@ -402,17 +411,8 @@ impl Node {
     }
 
     pub async fn connect(&mut self, remote_addr: SocketAddr) -> anyhow::Result<()> {
-        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let endpoint = make_client_endpoint(bind_addr, &[&self.cert])?;
-        let client = KrakenClient::new(endpoint, remote_addr, "localhost").await?;
-        self.peers.insert(remote_addr, client);
-        Ok(())
-    }
-
-    pub async fn insecure_connect(&mut self, remote_addr: SocketAddr) -> anyhow::Result<()> {
-        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let endpoint = make_insecure_client_endpoint(bind_addr)?;
-        let client = KrakenClient::new(endpoint, remote_addr, "localhost").await?;
+        let uri = format!("http://{}", remote_addr);
+        let client = KrakenClient2::new(&uri)?;
         self.peers.insert(remote_addr, client);
         Ok(())
     }
@@ -433,10 +433,14 @@ impl Node {
                     let mut query = query.clone();
                     query.bits = !mine.bitmap.clone();
                     query.bits.extend((0..1024).map(|_| true));
-                    let (_sink, mut stream) = peer.want(query).await?;
+                    let (sink, mut stream) = peer.want(query).await?;
+                    let mut n = 0;
+                    let mut bytes = 0;
                     while let Some(response) = stream.next().await {
                         match response? {
                             WantResponse::Block(index, block) => {
+                                n += 1;
+                                bytes += block.data.len();
                                 let cid = block.cid();
                                 let links = parse_links(&cid, &block.data)?;
                                 println!("got block {} {} {}", index, cid, links.len());
@@ -461,6 +465,8 @@ impl Node {
                             }
                         }
                     }
+                    println!("want query terminated after {} blocks {} bytes", n, bytes);
+                    drop(sink);
                 }
             }
         }
