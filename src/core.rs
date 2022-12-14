@@ -452,7 +452,7 @@ pub(crate) trait SyncApi: Debug + Send + Sync + 'static {
     fn want(
         &self,
         query: Query,
-        changes: BoxStream<WantRequestUpdate>,
+        changes: BoxStream<WantUpdate>,
     ) -> BoxFuture<anyhow::Result<BoxStream<WantResponse>>>;
 }
 
@@ -464,7 +464,7 @@ impl SyncApi for Box<dyn SyncApi> {
     fn want(
         &self,
         query: Query,
-        changes: BoxStream<WantRequestUpdate>,
+        changes: BoxStream<WantUpdate>,
     ) -> BoxFuture<anyhow::Result<BoxStream<WantResponse>>> {
         (**self).want(query, changes)
     }
@@ -494,7 +494,7 @@ impl SyncApi for Node {
     fn want(
         &self,
         query: Query,
-        changes: BoxStream<WantRequestUpdate>,
+        changes: BoxStream<WantUpdate>,
     ) -> BoxFuture<anyhow::Result<BoxStream<WantResponse>>> {
         let res = futures::stream::iter(self.store.clone().want(query));
         futures::future::ok(res.boxed()).boxed()

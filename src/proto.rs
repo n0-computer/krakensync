@@ -2,14 +2,49 @@ use ahash::AHashSet;
 use bitvec::prelude::*;
 use bytes::Bytes;
 use cid::Cid;
+use derive_more::{From, TryInto};
 use multihash::MultihashDigest;
+use quic_rpc::{message::BidiStreaming, Service};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, From, TryInto)]
 pub enum Request {
-    Want(Query),
-    Have(Query),
+    Want(Want),
+    WantUpdate(WantUpdate),
+    Have(Have),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, From, TryInto)]
+pub enum Response {
+    Want(WantResponse),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Want {
+    pub query: Query,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Have {
+    pub query: Query,
+}
+
+#[derive(Debug, Clone)]
+pub struct KrakenService;
+
+impl Service for KrakenService {
+    type Req = Request;
+
+    type Res = Response;
+}
+
+impl quic_rpc::message::Msg<KrakenService> for Want {
+    type Update = WantUpdate;
+
+    type Response = WantResponse;
+
+    type Pattern = BidiStreaming;
 }
 
 /// compact representation of a set of Cids
@@ -74,7 +109,11 @@ impl Debug for Query {
 
 fn fmt(bits: &BitVec) -> String {
     let max_len = 128;
-    let text = bits.iter().take(max_len).map(|b| if *b { '1' } else { '0' }).collect();
+    let text = bits
+        .iter()
+        .take(max_len)
+        .map(|b| if *b { '1' } else { '0' })
+        .collect();
     if bits.len() > max_len {
         format!("{}...", text)
     } else {
@@ -160,7 +199,7 @@ impl Block {
 
 /// Update of an ongoing request
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WantRequestUpdate {
+pub enum WantUpdate {
     /// Cancel values, e.g. if we got them already from another node
     Cancel(Bitmap),
     /// Request additional values, e.g. if another node has not delivered them

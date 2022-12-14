@@ -2,293 +2,159 @@ use ahash::HashMapExt;
 use anyhow::{bail, Context, Ok};
 use async_stream::try_stream;
 use cid::Cid;
-use futures::{stream::BoxStream, Sink, SinkExt, Stream, StreamExt};
+use futures::{
+    stream::{self, BoxStream},
+    Sink, SinkExt, Stream, StreamExt, TryFutureExt,
+};
 use libipld::{cbor::DagCborCodec, prelude::Codec, Ipld, IpldCodec};
-use quinn::{ClientConfig, Connecting, Endpoint, ServerConfig};
+use quic_rpc::{
+    client::BidiItemError,
+    transport::{http2::ServerChannel, Http2ChannelTypes},
+    RpcClient, RpcServer,
+};
 use std::{
     collections::BTreeMap,
     io::{self, stdout, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::Path,
+    result,
     sync::Arc,
     time::Instant,
 };
 use tokio::task::JoinHandle;
-use tokio_serde::{formats::SymmetricalBincode, SymmetricallyFramed};
-use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 use crate::{
     core::{Args, Store, StoreReadExt},
-    proto::{Query, Request, WantRequestUpdate, WantResponse},
+    proto::{KrakenService, Query, Request, Want, WantResponse, WantUpdate},
     test_util::make_tree,
 };
 
-/// Constructs a QUIC endpoint configured for use a client only.
-///
-/// ## Args
-///
-/// - server_certs: list of trusted certificates.
-#[allow(unused)]
-pub fn make_client_endpoint(
-    bind_addr: SocketAddr,
-    server_certs: &[&[u8]],
-) -> anyhow::Result<Endpoint> {
-    let client_cfg = configure_client(server_certs)?;
-    let mut endpoint = Endpoint::client(bind_addr)?;
-    endpoint.set_default_client_config(client_cfg);
-    Ok(endpoint)
-}
+#[derive(Debug, Clone)]
+pub struct RpcStore(Store);
 
-// insecure connection example from quinn-rs: https://github.com/quinn-rs/quinn/blob/369573482a1e716d3d7d47b2e74ab94cb1f88db5/quinn/examples/insecure_connection.rs
-// insecure connection example from quic-rs: https://github.com/n0-computer/quic-rpc/blob/1b17e92fb0d39df2204f22b31f50b4bfb5b837f0/examples/split/client/src/main.rs#L65
-pub fn make_insecure_client_endpoint(bind_addr: SocketAddr) -> anyhow::Result<Endpoint> {
-    let crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
-
-    let client_cfg = ClientConfig::new(Arc::new(crypto));
-    let mut endpoint = Endpoint::client(bind_addr)?;
-    endpoint.set_default_client_config(client_cfg);
-    Ok(endpoint)
-}
-
-struct SkipServerVerification;
-impl rustls::client::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        std::result::Result::Ok(rustls::client::ServerCertVerified::assertion())
-    }
-}
-
-/// Constructs a QUIC endpoint configured to listen for incoming connections on a certain address
-/// and port.
-///
-/// ## Returns
-///
-/// - a stream of incoming QUIC connections
-/// - server certificate serialized into DER format
-#[allow(unused)]
-pub fn make_server_endpoint(bind_addr: SocketAddr) -> anyhow::Result<(Endpoint, Vec<u8>)> {
-    let (server_config, server_cert) = configure_server()?;
-    let endpoint = Endpoint::server(server_config, bind_addr)?;
-    Ok((endpoint, server_cert))
-}
-
-/// Builds default quinn client config and trusts given certificates.
-///
-/// ## Args
-///
-/// - server_certs: a list of trusted certificates in DER format.
-fn configure_client(server_certs: &[&[u8]]) -> anyhow::Result<ClientConfig> {
-    let mut certs = rustls::RootCertStore::empty();
-    for cert in server_certs {
-        certs.add(&rustls::Certificate(cert.to_vec()))?;
-    }
-
-    Ok(ClientConfig::with_root_certificates(certs))
-}
-
-/// Returns default server configuration along with its certificate.
-#[allow(clippy::field_reassign_with_default)] // https://github.com/rust-lang/rust-clippy/issues/6527
-pub fn configure_server() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    let cert_der = cert.serialize_der()?;
-    let priv_key = cert.serialize_private_key_der();
-    let priv_key = rustls::PrivateKey(priv_key);
-    let cert_chain = vec![rustls::Certificate(cert_der.clone())];
-
-    let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
-    Arc::get_mut(&mut server_config.transport)
-        .unwrap()
-        .max_concurrent_uni_streams(0_u8.into());
-
-    Ok((server_config, cert_der))
-}
-
-async fn handle_client(incoming_conn: Connecting) -> anyhow::Result<()> {
-    let conn = incoming_conn.await.context("accept failed")?;
-    println!(
-        "[server] connection accepted: addr={}",
-        conn.remote_address()
-    );
-    let (send, recv) = conn.accept_bi().await?;
-    // turn chunks of bytes into a stream of messages using length delimited codec
-    let send = FramedWrite::new(send, LengthDelimitedCodec::new());
-    let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
-    // turn the stream of messages into a stream of strings
-    let mut recv = SymmetricallyFramed::new(recv, SymmetricalBincode::<String>::default());
-    let mut send = SymmetricallyFramed::new(send, SymmetricalBincode::<String>::default());
-    while let Some(msg) = recv.next().await {
-        let msg = msg?;
-        send.send(msg).await?;
-        println!("and sent it back!");
-    }
-    anyhow::Ok(())
-    // Dropping all handles associated with a connection implicitly closes it
-}
-
-async fn make_server(endpoint: Endpoint) -> anyhow::Result<()> {
-    // accept connections and process them on a separate task
-    while let Some(conn) = endpoint.accept().await {
-        tokio::spawn(handle_client(conn));
-    }
-    Ok(())
-}
-
-/// Server for the kraken sync protocol
-pub struct KrakenServer {
-    endpoint: Endpoint,
-    store: Store,
-}
-
-impl KrakenServer {
-    pub fn new(endpoint: Endpoint, store: Store) -> Self {
-        Self { endpoint, store }
-    }
-
-    pub async fn run(self) -> anyhow::Result<()> {
-        // accept connections and process them on a separate task
-        while let Some(conn) = self.endpoint.accept().await {
-            tokio::spawn(Self::handle_client(conn, self.store.clone()));
-        }
-        Ok(())
-    }
-
-    async fn handle_client(conn: Connecting, store: Store) -> anyhow::Result<()> {
-        let conn = conn.await.context("accept failed")?;
-        tracing::info!(
-            "[server] connection accepted: addr={}",
-            conn.remote_address()
-        );
-        loop {
-            let store = store.clone();
-            let (send, recv) = conn.accept_bi().await?;
-            // turn chunks of bytes into a stream of messages using length delimited codec
-            let send = FramedWrite::new(send, LengthDelimitedCodec::new());
-            let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
-            let mut recv = SymmetricallyFramed::new(recv, SymmetricalBincode::<Request>::default());
-            let request = recv.next().await.context("no msg")??;
-            tracing::info!("got request: {:?}", request);
-            match request {
-                Request::Want(query) => {
-                    let recv = recv.into_inner();
-                    // now switch to streams of WantRequestUpdate and WantResponse
-                    let recv = SymmetricallyFramed::new(
-                        recv,
-                        SymmetricalBincode::<WantRequestUpdate>::default(),
-                    );
-                    let send = SymmetricallyFramed::new(
-                        send,
-                        SymmetricalBincode::<WantResponse>::default(),
-                    );
-                    Self::handle_want(query, store, send, recv).await?;
-                }
-                Request::Have(_query) => {
-                    anyhow::bail!("not implemented");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_want(
-        query: Query,
-        store: Store,
-        mut send: impl Sink<WantResponse, Error = io::Error> + Unpin,
-        mut recv: impl Stream<Item = io::Result<WantRequestUpdate>> + Send + Sync + Unpin + 'static,
-    ) -> anyhow::Result<()> {
+impl RpcStore {
+    fn handle_want(
+        self,
+        req: Want,
+        mut recv: impl Stream<Item = WantUpdate> + Send + Sync + Unpin + 'static,
+    ) -> impl Stream<Item = WantResponse> {
         tracing::info!("handling want");
         tokio::spawn(async move {
             while let Some(recv) = recv.next().await {
-                let recv = recv?;
                 tracing::info!("got update: {:?}", recv);
             }
+            tracing::info!("no more want updates!");
             Ok(())
         });
-        for item in store.want(query) {
-            if let WantResponse::Block(o, b) = &item {
-                tracing::info!("sending block: {}", b.cid());
-            } else {
-                tracing::info!("sending item: {:?}", item);
+        stream::iter(self.0.want(req.query))
+            .map(|item| {
+                if let WantResponse::Block(o, b) = &item {
+                    tracing::info!("sending block: {} {}", o, b.cid());
+                } else {
+                    tracing::info!("sending item: {:?}", item);
+                }
+                item
+            })
+            .filter(|_| async move {
+                // this is so we get backpressure
+                tokio::task::yield_now().await;
+                true
+            })
+    }
+}
+
+pub struct KrakenServer2 {
+    hyper_handle: JoinHandle<anyhow::Result<()>>,
+    handler_handle: JoinHandle<anyhow::Result<()>>,
+}
+
+impl Drop for KrakenServer2 {
+    fn drop(&mut self) {
+        self.hyper_handle.abort();
+        self.handler_handle.abort();
+    }
+}
+
+impl KrakenServer2 {
+    pub fn new(addr: SocketAddr, store: Store) -> anyhow::Result<Self> {
+        let (channel, hyper) = ServerChannel::new(&addr)?;
+        let hyper_handle = tokio::spawn(hyper.map_err(|x| anyhow::anyhow!(x)));
+        let server = RpcServer::new(channel);
+        let handler_handle = tokio::task::spawn(Self::run(server, store));
+        Ok(Self {
+            hyper_handle,
+            handler_handle,
+        })
+    }
+
+    async fn run(
+        server: RpcServer<KrakenService, Http2ChannelTypes>,
+        store: Store,
+    ) -> anyhow::Result<()> {
+        loop {
+            let (req, c) = server.accept_one().await?;
+            let target = RpcStore(store.clone());
+            let s = server.clone();
+            let x = match req {
+                Request::Want(req) => {
+                    s.bidi_streaming(req, c, target, RpcStore::handle_want)
+                        .await
+                }
+                Request::WantUpdate(_) => {
+                    bail!("unexpected request");
+                }
+                Request::Have(_) => {
+                    bail!("not implemented");
+                }
+            };
+            if let Err(cause) = x {
+                tracing::error!("error handling request: {}", cause);
             }
-            send.send(item).await?;
         }
         Ok(())
     }
 }
 
-struct KrakenClient {
-    conn: quinn::Connection,
+struct KrakenClient2 {
+    client: RpcClient<KrakenService, Http2ChannelTypes>,
 }
 
-impl KrakenClient {
-    pub async fn new(
-        endpoint: Endpoint,
-        server_addr: SocketAddr,
-        server_name: &str,
-    ) -> anyhow::Result<Self> {
-        let conn = endpoint.connect(server_addr, server_name)?.await?;
-        tracing::info!("[client] connected: addr={}", conn.remote_address());
-        Ok(Self { conn })
+impl KrakenClient2 {
+    pub fn new(uri: &str) -> anyhow::Result<Self> {
+        let uri = uri.parse()?;
+        let channel = quic_rpc::transport::http2::ClientChannel::new(uri);
+        let client = RpcClient::new(channel);
+        Ok(Self { client })
     }
 
     pub async fn want(
         &self,
         query: Query,
     ) -> anyhow::Result<(
-        impl Sink<WantRequestUpdate>,
-        BoxStream<io::Result<WantResponse>>,
+        impl Sink<WantUpdate>,
+        impl Stream<Item = result::Result<WantResponse, BidiItemError<Http2ChannelTypes>>>,
     )> {
-        let (send, recv) = self.conn.open_bi().await?;
-        // turn chunks of bytes into a stream of messages using length delimited codec
-        let send = FramedWrite::new(send, LengthDelimitedCodec::new());
-        let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
-        let mut send = SymmetricallyFramed::new(send, SymmetricalBincode::<Request>::default());
-        // send a want request
-        tracing::info!("sending want request {:#?}", query);
-        send.send(Request::Want(query)).await?;
-        let send = send.into_inner();
-        // now switch to streams of WantRequestUpdate and WantResponse
-        let recv = SymmetricallyFramed::new(recv, SymmetricalBincode::<WantResponse>::default());
-        let send =
-            SymmetricallyFramed::new(send, SymmetricalBincode::<WantRequestUpdate>::default());
-        Ok((send, recv.boxed()))
+        let (updates, responses) = self.client.bidi(Want { query }).await?;
+        Ok((updates, responses))
     }
 }
 
 pub struct Node {
     port: u16,
     store: Store,
-    peers: BTreeMap<SocketAddr, KrakenClient>,
-    server: JoinHandle<anyhow::Result<()>>,
-    cert: Vec<u8>,
+    peers: BTreeMap<SocketAddr, KrakenClient2>,
+    server: KrakenServer2,
 }
 
 impl Node {
-    pub fn new(
-        store: Store,
-        port: u16,
-        server_config: ServerConfig,
-        cert: Vec<u8>,
-    ) -> anyhow::Result<Self> {
+    pub fn new(store: Store, port: u16) -> anyhow::Result<Self> {
         let server_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-        let endpoint = Endpoint::server(server_config, server_addr)?;
-        let server = KrakenServer::new(endpoint, store.clone());
-        let server = tokio::task::spawn(server.run());
+        let server = KrakenServer2::new(server_addr, store.clone())?;
         Ok(Self {
             port,
             store,
             peers: BTreeMap::new(),
             server,
-            cert,
         })
     }
 
@@ -299,17 +165,8 @@ impl Node {
     }
 
     pub async fn connect(&mut self, remote_addr: SocketAddr) -> anyhow::Result<()> {
-        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let endpoint = make_client_endpoint(bind_addr, &[&self.cert])?;
-        let client = KrakenClient::new(endpoint, remote_addr, "localhost").await?;
-        self.peers.insert(remote_addr, client);
-        Ok(())
-    }
-
-    pub async fn insecure_connect(&mut self, remote_addr: SocketAddr) -> anyhow::Result<()> {
-        let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let endpoint = make_insecure_client_endpoint(bind_addr)?;
-        let client = KrakenClient::new(endpoint, remote_addr, "localhost").await?;
+        let uri = format!("http://{}", remote_addr);
+        let client = KrakenClient2::new(&uri)?;
         self.peers.insert(remote_addr, client);
         Ok(())
     }
@@ -330,10 +187,14 @@ impl Node {
                     let mut query = query.clone();
                     query.bits = !mine.bitmap.clone();
                     query.bits.extend((0..1024).map(|_| true));
-                    let (_sink, mut stream) = peer.want(query).await?;
+                    let (sink, mut stream) = peer.want(query).await?;
+                    let mut n = 0;
+                    let mut bytes = 0;
                     while let Some(response) = stream.next().await {
                         match response? {
                             WantResponse::Block(index, block) => {
+                                n += 1;
+                                bytes += block.data.len();
                                 let cid = block.cid();
                                 let links = parse_links(&cid, &block.data)?;
                                 println!("got block {} {} {}", index, cid, links.len());
@@ -358,46 +219,13 @@ impl Node {
                             }
                         }
                     }
+                    println!("want query terminated after {} blocks {} bytes", n, bytes);
+                    drop(sink);
                 }
             }
         }
         .boxed()
     }
-}
-
-async fn make_client(endpoint: Endpoint, server_addr: SocketAddr) -> anyhow::Result<()> {
-    let connection = endpoint.connect(server_addr, "localhost")?.await?;
-    tracing::info!("[client] connected: addr={}", connection.remote_address());
-    let (send, recv) = connection.open_bi().await?;
-    // turn chunks of bytes into a stream of messages using length delimited codec
-    let send = FramedWrite::new(send, LengthDelimitedCodec::new());
-    let recv = FramedRead::new(recv, LengthDelimitedCodec::new());
-    // turn the stream of messages into a stream of strings
-    let mut recv = SymmetricallyFramed::new(recv, SymmetricalBincode::<String>::default());
-    let mut send = SymmetricallyFramed::new(send, SymmetricalBincode::<String>::default());
-    send.send("hello world".to_string()).await?;
-    if let Some(msg) = recv.next().await {
-        let msg = msg?;
-        println!("client got {}", msg);
-    }
-    send.into_inner().into_inner().finish().await?;
-
-    // Give the server has a chance to clean up
-    endpoint.wait_idle().await;
-    Ok(())
-}
-
-/// read hardcoded config for localhost
-pub fn read_localhost_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
-    let cert_der = include_bytes!("../certs/cert.der").to_vec();
-    let priv_key = include_bytes!("../certs/priv.key").to_vec();
-    let priv_key = rustls::PrivateKey(priv_key);
-    let cert_chain = vec![rustls::Certificate(cert_der.clone())];
-    let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key)?;
-    Arc::get_mut(&mut server_config.transport)
-        .unwrap()
-        .max_concurrent_uni_streams(0_u8.into());
-    Ok((server_config, cert_der))
 }
 
 /// Extract links from the given content.
@@ -428,7 +256,6 @@ fn to_v1(cid: &Cid) -> Cid {
 }
 
 pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
-    let (server_config, server_cert) = read_localhost_config()?;
     let store = Store::default();
     // create some data sets to sync
 
@@ -543,7 +370,7 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
     }
     let port = args.port.unwrap_or(31337);
     println!("listening on port {}", port);
-    let mut peer = Node::new(store, port, server_config.clone(), server_cert.clone())?;
+    let mut peer = Node::new(store, port)?;
     for addr in args.connect {
         println!("connecting to {:?}...", addr);
         peer.connect(addr).await?;
@@ -566,19 +393,8 @@ pub async fn sync_peer(args: Args) -> anyhow::Result<()> {
 }
 
 pub(crate) async fn peer_sync_demo() -> anyhow::Result<()> {
-    let (server_config, server_cert) = read_localhost_config()?;
-    let mut peer1 = Node::new(
-        Store::default(),
-        10001,
-        server_config.clone(),
-        server_cert.clone(),
-    )?;
-    let mut peer2 = Node::new(
-        Store::default(),
-        10002,
-        server_config.clone(),
-        server_cert.clone(),
-    )?;
+    let mut peer1 = Node::new(Store::default(), 10001)?;
+    let mut peer2 = Node::new(Store::default(), 10002)?;
     peer1.connect_local(10002).await?;
     peer2.connect_local(10001).await?;
     let mut leafs = (1u64..).map(|i| {
@@ -597,12 +413,9 @@ pub(crate) async fn peer_sync_demo() -> anyhow::Result<()> {
 pub async fn sync_demo() -> anyhow::Result<()> {
     let store = Store::default();
     let server_addr = "127.0.0.1:5000".parse()?;
-    let (endpoint, server_cert) = make_server_endpoint(server_addr)?;
-    let server = KrakenServer::new(endpoint, store.clone());
-    tokio::spawn(server.run());
+    let server = KrakenServer2::new(server_addr, store.clone());
 
-    let endpoint = make_client_endpoint("0.0.0.0:0".parse()?, &[&server_cert])?;
-    let client = KrakenClient::new(endpoint, server_addr, "localhost").await?;
+    let client = KrakenClient2::new("http://127.0.0.1:5000")?;
     let mut leafs = (1u64..).map(|i| {
         // 8 kb unique data
         i.to_be_bytes().repeat(1024)
@@ -613,21 +426,5 @@ pub async fn sync_demo() -> anyhow::Result<()> {
         let item = item?;
         println!("client got {:?}", item);
     }
-    Ok(())
-}
-
-pub async fn main() -> anyhow::Result<()> {
-    let server_addr = "127.0.0.1:5000".parse()?;
-    let (endpoint, server_cert) = make_server_endpoint(server_addr)?;
-    // accept a single connection
-    tokio::spawn(async move { make_server(endpoint).await });
-
-    let endpoint = make_client_endpoint("0.0.0.0:0".parse().unwrap(), &[&server_cert])?;
-    // connect to server
-    make_client(endpoint, server_addr).await?;
-
-    let endpoint = make_client_endpoint("0.0.0.0:0".parse().unwrap(), &[&server_cert])?;
-    make_client(endpoint, server_addr).await?;
-
     Ok(())
 }
